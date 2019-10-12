@@ -46,20 +46,6 @@ import (
 )
 
 const (
-	// IstioJwtFilterName is the name for the Istio Jwt filter. This should be the same
-	// as the name defined in
-	// https://github.com/istio/proxy/blob/master/src/envoy/http/jwt_auth/http_filter_factory.cc#L50
-	IstioJwtFilterName = "jwt-auth"
-
-	// EnvoyJwtFilterName is the name of the Envoy JWT filter. This should be the same as the name defined
-	// in https://github.com/envoyproxy/envoy/blob/v1.9.1/source/extensions/filters/http/well_known_names.h#L48
-	EnvoyJwtFilterName = "envoy.filters.http.jwt_authn"
-
-	// AuthnFilterName is the name for the Istio AuthN filter. This should be the same
-	// as the name defined in
-	// https://github.com/istio/proxy/blob/master/src/envoy/http/authn/http_filter_factory.cc#L30
-	AuthnFilterName = "istio_authn"
-
 	// The default header name for an exchanged token.
 	exchangedTokenHeaderName = "ingress-authorization"
 
@@ -141,7 +127,7 @@ func convertToEnvoyJwtConfig(policyJwts []*authn_v1alpha1.Jwt) *envoy_jwt.JwtAut
 		jwtPubKey := policyJwt.Jwks
 		if jwtPubKey == "" {
 			var err error
-			jwtPubKey, err = authn_model.JwtKeyResolver.GetPublicKey(policyJwt.JwksUri)
+			jwtPubKey, err = model.JwtKeyResolver.GetPublicKey(policyJwt.JwksUri)
 			if err != nil {
 				log.Errorf("Failed to fetch jwt public key from %q: %s", policyJwt.JwksUri, err)
 			}
@@ -200,7 +186,7 @@ func convertToIstioJwtConfig(policyJwts []*authn_v1alpha1.Jwt) *istio_jwt.JwtAut
 		jwtPubKey := policyJwt.Jwks
 		if jwtPubKey == "" {
 			var err error
-			jwtPubKey, err = authn_model.JwtKeyResolver.GetPublicKey(policyJwt.JwksUri)
+			jwtPubKey, err = model.JwtKeyResolver.GetPublicKey(policyJwt.JwksUri)
 			if err != nil {
 				log.Errorf("Failed to fetch jwt public key from %q: %s", policyJwt.JwksUri, err)
 			}
@@ -230,11 +216,11 @@ func convertPolicyToJwtConfig(policy *authn_v1alpha1.Policy) (string, proto.Mess
 	}
 
 	if features.UseIstioJWTFilter.Get() {
-		return IstioJwtFilterName, convertToIstioJwtConfig(policyJwts)
+		return authn_model.IstioJwtFilterName, convertToIstioJwtConfig(policyJwts)
 	}
 
 	log.Debugf("Envoy JWT filter is used for JWT verification")
-	return EnvoyJwtFilterName, convertToEnvoyJwtConfig(policyJwts)
+	return authn_model.EnvoyJwtFilterName, convertToEnvoyJwtConfig(policyJwts)
 }
 
 // convertPolicyToAuthNFilterConfig returns an authn filter config corresponding for the input policy.
@@ -320,7 +306,7 @@ func (a v1alpha1PolicyApplier) AuthNFilter(proxyType model.NodeType, isXDSMarsha
 		return nil
 	}
 	out := &http_conn.HttpFilter{
-		Name: AuthnFilterName,
+		Name: authn_model.AuthnFilterName,
 	}
 	if isXDSMarshalingToAnyEnabled {
 		out.ConfigType = &http_conn.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(filterConfigProto)}
@@ -330,7 +316,7 @@ func (a v1alpha1PolicyApplier) AuthNFilter(proxyType model.NodeType, isXDSMarsha
 	return out
 }
 
-func (a v1alpha1PolicyApplier) InboundFilterChain(sdsUdsPath string, meta map[string]string) []plugin.FilterChain {
+func (a v1alpha1PolicyApplier) InboundFilterChain(sdsUdsPath string, meta *model.NodeMetadata) []plugin.FilterChain {
 	if a.policy == nil || len(a.policy.Peers) == 0 {
 		return nil
 	}
@@ -353,13 +339,13 @@ func (a v1alpha1PolicyApplier) InboundFilterChain(sdsUdsPath string, meta map[st
 		RequireClientCertificate: protovalue.BoolTrue,
 	}
 	if sdsUdsPath == "" {
-		base := meta[features.BaseDir] + constants.AuthCertsPath
-		tlsServerRootCert := model.GetOrDefaultFromMap(meta, model.NodeMetadataTLSServerRootCert, base+constants.RootCertFilename)
+		base := meta.SdsBase + constants.AuthCertsPath
+		tlsServerRootCert := model.GetOrDefault(meta.TLSServerRootCert, base+constants.RootCertFilename)
 
 		tls.CommonTlsContext.ValidationContextType = authn_model.ConstructValidationContext(tlsServerRootCert, []string{} /*subjectAltNames*/)
 
-		tlsServerCertChain := model.GetOrDefaultFromMap(meta, model.NodeMetadataTLSServerCertChain, base+constants.CertChainFilename)
-		tlsServerKey := model.GetOrDefaultFromMap(meta, model.NodeMetadataTLSServerKey, base+constants.KeyFilename)
+		tlsServerCertChain := model.GetOrDefault(meta.TLSServerCertChain, base+constants.CertChainFilename)
+		tlsServerKey := model.GetOrDefault(meta.TLSServerKey, base+constants.KeyFilename)
 
 		tls.CommonTlsContext.TlsCertificates = []*auth.TlsCertificate{
 			{

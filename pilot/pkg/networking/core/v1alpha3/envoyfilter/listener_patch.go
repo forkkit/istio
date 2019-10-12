@@ -24,14 +24,25 @@ import (
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/any"
 
+	"istio.io/pkg/log"
+
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
 )
 
 // ApplyListenerPatches applies patches to LDS output
-func ApplyListenerPatches(patchContext networking.EnvoyFilter_PatchContext,
-	proxy *model.Proxy, push *model.PushContext, listeners []*xdsapi.Listener, skipAdds bool) []*xdsapi.Listener {
+func ApplyListenerPatches(
+	patchContext networking.EnvoyFilter_PatchContext,
+	proxy *model.Proxy,
+	push *model.PushContext,
+	listeners []*xdsapi.Listener,
+	skipAdds bool) (out []*xdsapi.Listener) {
+	defer util.HandleCrash(func() {
+		log.Errorf("listeners patch caused panic, so the patches did not take effect")
+	})
+	// In case the patches cause panic, use the listeners generated before to reduce the influence.
+	out = listeners
 
 	envoyFilterWrappers := push.EnvoyFilters(proxy)
 	return doListenerListOperation(proxy, patchContext, envoyFilterWrappers, listeners, skipAdds)
@@ -553,8 +564,8 @@ func proxyMatch(proxy *model.Proxy, cp *model.EnvoyFilterConfigPatchWrapper) boo
 	}
 
 	if cp.ProxyVersionRegex != nil {
-		ver, exists := proxy.GetIstioVersion()
-		if !exists {
+		ver := proxy.Metadata.IstioVersion
+		if ver == "" {
 			// we dont have a proxy version but the user has a regex. so this is a mismatch
 			return false
 		}
@@ -564,7 +575,7 @@ func proxyMatch(proxy *model.Proxy, cp *model.EnvoyFilterConfigPatchWrapper) boo
 	}
 
 	for k, v := range cp.Match.Proxy.Metadata {
-		if proxy.Metadata[k] != v {
+		if proxy.Metadata.Raw[k] != v {
 			return false
 		}
 	}

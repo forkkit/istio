@@ -52,10 +52,50 @@ const (
 
 	// IngressGatewaySdsCaSuffix is the suffix of the sds resource name for root CA.
 	IngressGatewaySdsCaSuffix = "-cacert"
+
+	// IstioJwtFilterName is the name for the Istio Jwt filter. This should be the same
+	// as the name defined in
+	// https://github.com/istio/proxy/blob/master/src/envoy/http/jwt_auth/http_filter_factory.cc#L50
+	IstioJwtFilterName = "jwt-auth"
+
+	// EnvoyJwtFilterName is the name of the Envoy JWT filter. This should be the same as the name defined
+	// in https://github.com/envoyproxy/envoy/blob/v1.9.1/source/extensions/filters/http/well_known_names.h#L48
+	EnvoyJwtFilterName = "envoy.filters.http.jwt_authn"
+
+	// AuthnFilterName is the name for the Istio AuthN filter. This should be the same
+	// as the name defined in
+	// https://github.com/istio/proxy/blob/master/src/envoy/http/authn/http_filter_factory.cc#L30
+	AuthnFilterName = "istio_authn"
 )
 
-// JwtKeyResolver resolves JWT public key and JwksURI.
-var JwtKeyResolver = model.NewJwksResolver(model.JwtPubKeyEvictionDuration, model.JwtPubKeyRefreshInterval)
+// MutualTLSMode is the mutule TLS mode specified by authentication policy.
+type MutualTLSMode int
+
+const (
+	// MTLSUnknown is used to indicate the variable hasn't been initialized correctly (with the authentication policy).
+	MTLSUnknown MutualTLSMode = iota
+
+	// MTLSDisable if authentication policy disable mTLS.
+	MTLSDisable
+
+	// MTLSPermissive if authentication policy enable mTLS in permissive mode.
+	MTLSPermissive
+
+	// MTLSStrict if authentication policy enable mTLS in strict mode.
+	MTLSStrict
+)
+
+// String converts MutualTLSMode to human readable string for debugging.
+func (mode MutualTLSMode) String() string {
+	// declare an array of strings
+	names := [...]string{
+		"UNKNOWN",
+		"DISABLE",
+		"PERMISSIVE",
+		"STRICT"}
+
+	return names[mode]
+}
 
 // ConstructSdsSecretConfigForGatewayListener constructs SDS secret configuration for ingress gateway.
 func ConstructSdsSecretConfigForGatewayListener(name, sdsUdsPath string) *auth.SdsSecretConfig {
@@ -89,7 +129,7 @@ func ConstructSdsSecretConfigForGatewayListener(name, sdsUdsPath string) *auth.S
 }
 
 // ConstructSdsSecretConfig constructs SDS Sececret Configuration for workload proxy.
-func ConstructSdsSecretConfig(name, sdsUdsPath string, metadata map[string]string) *auth.SdsSecretConfig {
+func ConstructSdsSecretConfig(name, sdsUdsPath string, metadata *model.NodeMetadata) *auth.SdsSecretConfig {
 	if name == "" || sdsUdsPath == "" {
 		return nil
 	}
@@ -104,10 +144,10 @@ func ConstructSdsSecretConfig(name, sdsUdsPath string, metadata map[string]strin
 		},
 	}
 
-	// If metadata[NodeMetadataSdsTokenPath] is non-empty, envoy will fetch tokens from metadata[NodeMetadataSdsTokenPath].
+	// If metadata.SdsTokenPath is non-empty, envoy will fetch tokens from metadata.SdsTokenPath.
 	// Otherwise, if useK8sSATrustworthyJwt is set, envoy will fetch and pass k8s sa trustworthy jwt(which is available for k8s 1.12 or higher),
 	// pass it to SDS server to request key/cert.
-	if sdsTokenPath, found := metadata[model.NodeMetadataSdsTokenPath]; found && len(sdsTokenPath) > 0 {
+	if sdsTokenPath := metadata.SdsTokenPath; len(sdsTokenPath) > 0 {
 		log.Debugf("SDS token path is (%v)", sdsTokenPath)
 		gRPCConfig.CredentialsFactoryName = FileBasedMetadataPlugName
 		gRPCConfig.CallCredentials = ConstructgRPCCallCredentials(sdsTokenPath, K8sSAJwtTokenHeaderKey)

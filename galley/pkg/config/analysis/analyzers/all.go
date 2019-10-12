@@ -17,21 +17,33 @@ package analyzers
 import (
 	"istio.io/istio/galley/pkg/config/analysis"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/auth"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/deprecation"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/gateway"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/injection"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/schema"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/virtualservice"
 )
 
 // All returns all analyzers
 func All() []analysis.Analyzer {
-	return []analysis.Analyzer{
-		&virtualservice.GatewayAnalyzer{},
-		&virtualservice.DestinationAnalyzer{},
+	analyzers := []analysis.Analyzer{
+		// Please keep this list sorted alphabetically by pkg.name for convenience
 		&auth.ServiceRoleBindingAnalyzer{},
+		&deprecation.FieldAnalyzer{},
+		&gateway.IngressGatewayPortAnalyzer{},
 		&injection.Analyzer{},
+		&injection.VersionAnalyzer{},
+		&virtualservice.DestinationHostAnalyzer{},
+		&virtualservice.DestinationRuleAnalyzer{},
+		&virtualservice.GatewayAnalyzer{},
 	}
+
+	analyzers = append(analyzers, schema.AllValidationAnalyzers()...)
+
+	return analyzers
 }
 
 // AllCombined returns all analyzers combined as one
-func AllCombined() analysis.Analyzer {
+func AllCombined() *analysis.CombinedAnalyzer {
 	return analysis.Combine("all", All()...)
 }

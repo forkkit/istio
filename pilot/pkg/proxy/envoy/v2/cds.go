@@ -15,7 +15,6 @@
 package v2
 
 import (
-	"fmt"
 	"time"
 
 	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
@@ -49,7 +48,7 @@ func (conn *XdsConnection) clusters(response []*xdsapi.Cluster) *xdsapi.Discover
 func (s *DiscoveryServer) pushCds(con *XdsConnection, push *model.PushContext, version string) error {
 	// TODO: Modify interface to take services, and config instead of making library query registry
 	pushStart := time.Now()
-	rawClusters := s.generateRawClusters(con.modelNode, push)
+	rawClusters := s.generateRawClusters(con.node, push)
 
 	if s.DebugConfigs {
 		con.CDSClusters = rawClusters
@@ -66,7 +65,7 @@ func (s *DiscoveryServer) pushCds(con *XdsConnection, push *model.PushContext, v
 
 	// The response can't be easily read due to 'any' marshaling.
 	adsLog.Infof("CDS: PUSH for node:%s clusters:%d services:%d version:%s",
-		con.modelNode.ID, len(rawClusters), len(push.Services(nil)), version)
+		con.node.ID, len(rawClusters), len(push.Services(nil)), version)
 	return nil
 }
 
@@ -75,14 +74,11 @@ func (s *DiscoveryServer) generateRawClusters(node *model.Proxy, push *model.Pus
 
 	for _, c := range rawClusters {
 		if err := c.Validate(); err != nil {
-			retErr := fmt.Errorf("CDS: Generated invalid cluster for node %v: %v", node, err)
 			adsLog.Errorf("CDS: Generated invalid cluster for node:%s: %v, %v", node.ID, err, c)
 			cdsBuildErrPushes.Increment()
 			totalXDSInternalErrors.Increment()
 			// Generating invalid clusters is a bug.
-			// Panic instead of trying to recover from that, since we can't
-			// assume anything about the state.
-			panic(retErr.Error())
+			// Instead of panic, which will break down the whole cluster. Just ignore it here, let envoy process it.
 		}
 	}
 	return rawClusters
