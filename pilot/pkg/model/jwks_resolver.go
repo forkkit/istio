@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,12 +22,15 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	authn "istio.io/api/authentication/v1alpha1"
+	"istio.io/api/security/v1beta1"
 	"istio.io/pkg/cache"
 	"istio.io/pkg/monitoring"
 )
@@ -70,12 +73,14 @@ const (
 	// means it's called when the periodically refresh job is triggered. We can retry more aggressively
 	// as it's running separately from the main flow.
 	networkFetchRetryCountOnRefreshFlow = 3
+
+	// jwksPublicRootCABundlePath is the path of public root CA bundle in pilot container.
+	jwksPublicRootCABundlePath = "/cacert.pem"
+	// jwksExtraRootCABundlePath is the path to any additional CA certificates pilot should accept when resolving JWKS URIs
+	jwksExtraRootCABundlePath = "/cacerts/extra.pem"
 )
 
 var (
-	// PublicRootCABundlePath is the path of public root CA bundle in pilot container.
-	publicRootCABundlePath = "/cacert.pem"
-
 	// Close channel
 	closeChan = make(chan bool)
 
@@ -88,8 +93,9 @@ var (
 		"Total number of failed network fetch by pilot jwks resolver",
 	)
 
-	// JwtKeyResolver resolves JWT public key and JwksURI.
-	JwtKeyResolver = NewJwksResolver(JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval)
+	// jwtKeyResolverOnce lazy init jwt key resolver
+	jwtKeyResolverOnce sync.Once
+	jwtKeyResolver     *JwksResolver
 )
 
 // jwtPubKeyEntry is a single cached entry for jwt public key.
@@ -138,15 +144,28 @@ func init() {
 
 // NewJwksResolver creates new instance of JwksResolver.
 func NewJwksResolver(evictionDuration, refreshInterval time.Duration) *JwksResolver {
+	return newJwksResolverWithCABundlePaths(
+		evictionDuration,
+		refreshInterval,
+		[]string{jwksPublicRootCABundlePath, jwksExtraRootCABundlePath},
+	)
+}
+
+// GetJwtKeyResolver lazy-creates JwtKeyResolver resolves JWT public key and JwksURI.
+func GetJwtKeyResolver() *JwksResolver {
+	jwtKeyResolverOnce.Do(func() {
+		jwtKeyResolver = NewJwksResolver(JwtPubKeyEvictionDuration, JwtPubKeyRefreshInterval)
+	})
+	return jwtKeyResolver
+}
+
+func newJwksResolverWithCABundlePaths(evictionDuration, refreshInterval time.Duration, caBundlePaths []string) *JwksResolver {
 	ret := &JwksResolver{
 		JwksURICache:     cache.NewTTL(jwksURICacheExpiration, jwksURICacheEviction),
 		evictionDuration: evictionDuration,
 		refreshInterval:  refreshInterval,
 		httpClient: &http.Client{
 			Timeout: jwksHTTPTimeOutInSec * time.Second,
-
-			// TODO: pilot needs to include a collection of root CAs to make external
-			// https web request(https://github.com/istio/istio/issues/1419).
 			Transport: &http.Transport{
 				DisableKeepAlives: true,
 				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
@@ -154,10 +173,15 @@ func NewJwksResolver(evictionDuration, refreshInterval time.Duration) *JwksResol
 		},
 	}
 
-	caCert, err := ioutil.ReadFile(publicRootCABundlePath)
-	if err == nil {
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
+	caCertPool := x509.NewCertPool()
+	caCertsFound := false
+	for _, pemFile := range caBundlePaths {
+		caCert, err := ioutil.ReadFile(pemFile)
+		if err == nil {
+			caCertsFound = caCertPool.AppendCertsFromPEM(caCert) || caCertsFound
+		}
+	}
+	if caCertsFound {
 		ret.secureHTTPClient = &http.Client{
 			Timeout: jwksHTTPTimeOutInSec * time.Second,
 			Transport: &http.Transport{
@@ -185,6 +209,7 @@ func (r *JwksResolver) SetAuthenticationPolicyJwksURIs(policy *authn.Policy) err
 	for _, method := range policy.Peers {
 		switch method.GetParams().(type) {
 		case *authn.PeerAuthenticationMethod_Jwt:
+			// nolint: staticcheck
 			policyJwt := method.GetJwt()
 			if policyJwt.JwksUri == "" && policyJwt.Jwks == "" {
 				uri, err := r.resolveJwksURIUsingOpenID(policyJwt.Issuer)
@@ -210,6 +235,19 @@ func (r *JwksResolver) SetAuthenticationPolicyJwksURIs(policy *authn.Policy) err
 	}
 
 	return nil
+}
+
+// ResolveJwksURI sets jwks_uri through openID discovery if it's not set in request authentication policy.
+func (r *JwksResolver) ResolveJwksURI(policy *v1beta1.RequestAuthentication) {
+	for _, rule := range policy.JwtRules {
+		if rule.JwksUri == "" && rule.Jwks == "" {
+			if uri, err := r.resolveJwksURIUsingOpenID(rule.Issuer); err == nil {
+				rule.JwksUri = uri
+			} else {
+				log.Warnf("Failed to get jwks_uri for issuer %q: %v", rule.Issuer, err)
+			}
+		}
+	}
 }
 
 // GetPublicKey gets JWT public key and cache the key for future use.
@@ -381,7 +419,12 @@ func (r *JwksResolver) refresh() {
 				lastRefreshedTime: now,            // update the lastRefreshedTime if we get a success response from the network.
 				lastUsedTime:      e.lastUsedTime, // keep original lastUsedTime.
 			})
-			if oldPubKey != newPubKey {
+			isNewKey, err := compareJWKSResponse(oldPubKey, newPubKey)
+			if err != nil {
+				log.Errorf("Failed to refresh JWT public key from %q: %v", jwksURI, err)
+				return
+			}
+			if isNewKey {
 				hasChange = true
 				log.Infof("Updated cached JWT public key from %q", jwksURI)
 			}
@@ -407,4 +450,68 @@ func (r *JwksResolver) refresh() {
 // (right now calls it from initDiscoveryService in pkg/bootstrap/server.go).
 func (r *JwksResolver) Close() {
 	closeChan <- true
+}
+
+// Compare two JWKS responses, returning true if there is a difference and false otherwise
+func compareJWKSResponse(oldKeyString string, newKeyString string) (bool, error) {
+	if oldKeyString == newKeyString {
+		return false, nil
+	}
+
+	var oldJWKs map[string]interface{}
+	var newJWKs map[string]interface{}
+	if err := json.Unmarshal([]byte(newKeyString), &newJWKs); err != nil {
+		// If the new key is not parseable as JSON return an error since we will not want to use this key
+		log.Warnf("New JWKs public key JSON is not parseable: %s", newKeyString)
+		return false, err
+	}
+	if err := json.Unmarshal([]byte(oldKeyString), &oldJWKs); err != nil {
+		log.Warnf("Previous JWKs public key JSON is not parseable: %s", oldKeyString)
+		return true, nil
+	}
+
+	// Sort both sets of keys by "kid (key ID)" to be able to directly compare
+	oldKeys, oldKeysExists := oldJWKs["keys"].([]interface{})
+	newKeys, newKeysExists := newJWKs["keys"].([]interface{})
+	if oldKeysExists && newKeysExists {
+		sort.Slice(oldKeys, func(i, j int) bool {
+			key1, ok1 := oldKeys[i].(map[string]interface{})
+			key2, ok2 := oldKeys[j].(map[string]interface{})
+			if ok1 && ok2 {
+				key1Id, kid1Exists := key1["kid"]
+				key2Id, kid2Exists := key2["kid"]
+				if kid1Exists && kid2Exists {
+					key1IdStr, ok1 := key1Id.(string)
+					key2IdStr, ok2 := key2Id.(string)
+					if ok1 && ok2 {
+						return key1IdStr < key2IdStr
+					}
+				}
+			}
+			return len(key1) < len(key2)
+		})
+		sort.Slice(newKeys, func(i, j int) bool {
+			key1, ok1 := newKeys[i].(map[string]interface{})
+			key2, ok2 := newKeys[j].(map[string]interface{})
+			if ok1 && ok2 {
+				key1Id, kid1Exists := key1["kid"]
+				key2Id, kid2Exists := key2["kid"]
+				if kid1Exists && kid2Exists {
+					key1IdStr, ok1 := key1Id.(string)
+					key2IdStr, ok2 := key2Id.(string)
+					if ok1 && ok2 {
+						return key1IdStr < key2IdStr
+					}
+				}
+			}
+			return len(key1) < len(key2)
+		})
+
+		// Once sorted, return the result of deep comparison of the arrays of keys
+		return !reflect.DeepEqual(oldKeys, newKeys), nil
+	}
+
+	// If we aren't able to compare using keys, we should return true
+	// since we already checked exact equality of the responses
+	return true, nil
 }

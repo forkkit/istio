@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -74,7 +74,13 @@ func isRetryableErr(c codes.Code, httpRespCode int, isGrpc bool) bool {
 }
 
 // cacheLogPrefix returns a unified log prefix.
-func cacheLogPrefix(conID, resourceName string) string {
-	lPrefix := fmt.Sprintf("CONNECTION ID: %s, RESOURCE NAME: %s, EVENT:", conID, resourceName)
+func cacheLogPrefix(resourceName string) string {
+	lPrefix := fmt.Sprintf("resource:%s", resourceName)
+	return lPrefix
+}
+
+// cacheLogPrefix returns a unified log prefix.
+func cacheLogPrefixWithReqID(resourceName, reqID string) string {
+	lPrefix := fmt.Sprintf("resource:%s request:%s", resourceName, reqID)
 	return lPrefix
 }

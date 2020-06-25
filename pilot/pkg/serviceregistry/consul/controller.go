@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,17 +17,19 @@ package consul
 import (
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/hashicorp/consul/api"
 
 	"istio.io/pkg/log"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/spiffe"
 )
+
+var _ serviceregistry.Instance = &Controller{}
 
 // Controller communicates with Consul and monitors for changes
 type Controller struct {
@@ -38,24 +40,34 @@ type Controller struct {
 	serviceInstances map[string][]*model.ServiceInstance //key hostname value serviceInstance array
 	cacheMutex       sync.Mutex
 	initDone         bool
+	clusterID        string
 }
 
 // NewController creates a new Consul controller
-func NewController(addr string, interval time.Duration) (*Controller, error) {
+func NewController(addr string, clusterID string) (*Controller, error) {
 	conf := api.DefaultConfig()
 	conf.Address = addr
 
 	client, err := api.NewClient(conf)
-	monitor := NewConsulMonitor(client, interval)
+	monitor := NewConsulMonitor(client)
 	controller := Controller{
-		monitor: monitor,
-		client:  client,
+		monitor:   monitor,
+		client:    client,
+		clusterID: clusterID,
 	}
 
 	//Watch the change events to refresh local caches
 	monitor.AppendServiceHandler(controller.ServiceChanged)
 	monitor.AppendInstanceHandler(controller.InstanceChanged)
 	return &controller, err
+}
+
+func (c *Controller) Provider() serviceregistry.ProviderID {
+	return serviceregistry.Consul
+}
+
+func (c *Controller) Cluster() string {
+	return c.clusterID
 }
 
 // Services list declarations of all services in the system
@@ -94,22 +106,6 @@ func (c *Controller) GetService(hostname host.Name) (*model.Service, error) {
 	return nil, nil
 }
 
-// ManagementPorts retrieves set of health check ports by instance IP.
-// This does not apply to Consul service registry, as Consul does not
-// manage the service instances. In future, when we integrate Nomad, we
-// might revisit this function.
-func (c *Controller) ManagementPorts(addr string) model.PortList {
-	return nil
-}
-
-// WorkloadHealthCheckInfo retrieves set of health check info by instance IP.
-// This does not apply to Consul service registry, as Consul does not
-// manage the service instances. In future, when we integrate Nomad, we
-// might revisit this function.
-func (c *Controller) WorkloadHealthCheckInfo(addr string) model.ProbeList {
-	return nil
-}
-
 // InstancesByPort retrieves instances for a service that match
 // any of the supplied labels. All instances match an empty tag list.
 func (c *Controller) InstancesByPort(svc *model.Service, port int,
@@ -132,7 +128,7 @@ func (c *Controller) InstancesByPort(svc *model.Service, port int,
 	if serviceInstances, ok := c.serviceInstances[name]; ok {
 		var instances []*model.ServiceInstance
 		for _, instance := range serviceInstances {
-			if labels.HasSubsetOf(instance.Labels) && portMatch(instance, port) {
+			if labels.HasSubsetOf(instance.Endpoint.Labels) && portMatch(instance, port) {
 				instances = append(instances, instance)
 			}
 		}
@@ -144,7 +140,7 @@ func (c *Controller) InstancesByPort(svc *model.Service, port int,
 
 // returns true if an instance's port matches with any in the provided list
 func portMatch(instance *model.ServiceInstance, port int) bool {
-	return port == 0 || port == instance.Endpoint.ServicePort.Port
+	return port == 0 || port == instance.ServicePort.Port
 }
 
 // GetProxyServiceInstances lists service instances co-located with a given proxy
@@ -191,7 +187,7 @@ func (c *Controller) GetProxyWorkloadLabels(proxy *model.Proxy) (labels.Collecti
 			if len(proxy.IPAddresses) > 0 {
 				for _, ipAddress := range proxy.IPAddresses {
 					if ipAddress == addr {
-						out = append(out, instance.Labels)
+						out = append(out, instance.Endpoint.Labels)
 						break
 					}
 				}
@@ -205,6 +201,11 @@ func (c *Controller) GetProxyWorkloadLabels(proxy *model.Proxy) (labels.Collecti
 // Run all controllers until a signal is received
 func (c *Controller) Run(stop <-chan struct{}) {
 	c.monitor.Start(stop)
+}
+
+// HasSynced always returns true for consul
+func (c *Controller) HasSynced() bool {
+	return true
 }
 
 // AppendServiceHandler implements a service catalog operation

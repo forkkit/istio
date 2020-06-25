@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -22,12 +22,13 @@ import (
 	"google.golang.org/grpc"
 
 	istioMixerV1 "istio.io/api/mixer/v1"
+	"istio.io/pkg/attribute"
+
 	attr "istio.io/istio/mixer/pkg/attribute"
 	"istio.io/istio/mixer/pkg/server"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/framework/resource"
 	"istio.io/istio/pkg/test/kube"
-	"istio.io/pkg/attribute"
 )
 
 const (
@@ -46,13 +47,8 @@ type client struct {
 	clients    map[string]istioMixerV1.MixerClient
 	forwarders []kube.PortForwarder
 
-	args    *server.Args
-	server  *server.Server
-	workdir string
-
-	// AttributeManifest is injected into the configuration in the local environment. in Kubernetes, it
-	// should already exist as part of Istio deployment.
-	attributeManifest string
+	args   *server.Args
+	server *server.Server
 }
 
 // Report implements DeployedMixer.Report.

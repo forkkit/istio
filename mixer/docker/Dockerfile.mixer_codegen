@@ -1,14 +1,16 @@
 # BASE_DISTRIBUTION is used to switch between the old base distribution and distroless base images
 ARG BASE_DISTRIBUTION=default
 
+# Version is the base image version from the TLD Makefile
+ARG BASE_VERSION=latest
+
 # The following section is used as base image if BASE_DISTRIBUTION=default
-# No tag available https://hub.docker.com/_/scratch?tab=description
-# hadolint ignore=DL3006
-FROM scratch as default
+FROM docker.io/istio/base:${BASE_VERSION} as default
+
+USER 1337:1337
 
 # The following section is used as base image if BASE_DISTRIBUTION=distroless
-# hadolint ignore=DL3007
-FROM gcr.io/distroless/static:latest as distroless
+FROM gcr.io/distroless/static-debian10@sha256:4433370ec2b3b97b338674b4de5ffaef8ce5a38d1c9c0cb82403304b8718cde9 as distroless
 
 # This will build the final image based on either default or distroless from above
 # hadolint ignore=DL3006

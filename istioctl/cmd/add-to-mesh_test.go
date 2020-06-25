@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,18 +20,15 @@ import (
 	"strings"
 	"testing"
 
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/client-go/dynamic"
-
-	"istio.io/istio/pkg/config/schemas"
-
-	//"istio.io/istio/pilot/pkg/config/kube/crd"
 	appsv1 "k8s.io/api/apps/v1"
 	coreV1 "k8s.io/api/core/v1"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
+
+	"istio.io/istio/pkg/config/schema/collections"
 )
 
 type testcase struct {
@@ -68,7 +65,7 @@ var (
 							Labels: map[string]string{"app": "details"},
 						},
 						Spec: coreV1.PodSpec{
-							Containers: []v1.Container{
+							Containers: []coreV1.Container{
 								{Name: "details", Image: "docker.io/istio/examples-bookinfo-details-v1:1.15.0"},
 							},
 						},
@@ -112,8 +109,8 @@ var (
 	cannedDynamicConfigs = []runtime.Object{
 		&unstructured.Unstructured{
 			Object: map[string]interface{}{
-				"apiVersion": "networking.istio.io/" + schemas.ServiceEntry.Version,
-				"kind":       schemas.ServiceEntry.VariableName,
+				"apiVersion": collections.IstioNetworkingV1Alpha3Serviceentries.Resource().APIVersion(),
+				"kind":       collections.IstioNetworkingV1Alpha3Serviceentries.Resource().Kind(),
 				"metadata": map[string]interface{}{
 					"namespace": "default",
 					"name":      "mesh-expansion-vmtest",
@@ -126,13 +123,19 @@ var (
 func TestAddToMesh(t *testing.T) {
 	cases := []testcase{
 		{
-			description:       "Invalid command args",
+			description:       "Invalid command args - missing service name",
 			args:              strings.Split("experimental add-to-mesh service", " "),
 			expectedException: true,
 			expectedOutput:    "Error: expecting service name\n",
 		},
 		{
-			description: "valid case",
+			description:       "Invalid command args - missing deployment name",
+			args:              strings.Split("experimental add-to-mesh deployment", " "),
+			expectedException: true,
+			expectedOutput:    "Error: expecting deployment name\n",
+		},
+		{
+			description: "valid case - add service into mesh",
 			args: strings.Split("experimental add-to-mesh service details --meshConfigFile testdata/mesh-config.yaml"+
 				" --injectConfigFile testdata/inject-config.yaml"+
 				" --valuesFile testdata/inject-values.yaml", " "),
@@ -144,13 +147,34 @@ func TestAddToMesh(t *testing.T) {
 			namespace: "default",
 		},
 		{
-			description: "service not exists",
+			description: "valid case - add deployment into mesh",
+			args: strings.Split("experimental add-to-mesh deployment details-v1 --meshConfigFile testdata/mesh-config.yaml"+
+				" --injectConfigFile testdata/inject-config.yaml"+
+				" --valuesFile testdata/inject-values.yaml", " "),
+			expectedException: false,
+			k8sConfigs:        cannedK8sConfigs,
+			expectedOutput: "deployment details-v1.default updated successfully with Istio sidecar injected.\n" +
+				"Next Step: Add related labels to the deployment to align with Istio's requirement: " +
+				"https://istio.io/docs/setup/kubernetes/additional-setup/requirements/\n",
+			namespace: "default",
+		},
+		{
+			description: "service does not exist",
 			args: strings.Split("experimental add-to-mesh service test --meshConfigFile testdata/mesh-config.yaml"+
 				" --injectConfigFile testdata/inject-config.yaml"+
 				" --valuesFile testdata/inject-values.yaml", " "),
 			expectedException: true,
 			k8sConfigs:        cannedK8sConfigs,
 			expectedOutput:    "Error: services \"test\" not found\n",
+		},
+		{
+			description: "deployment does not exist",
+			args: strings.Split("experimental add-to-mesh deployment test --meshConfigFile testdata/mesh-config.yaml"+
+				" --injectConfigFile testdata/inject-config.yaml"+
+				" --valuesFile testdata/inject-values.yaml", " "),
+			expectedException: true,
+			k8sConfigs:        cannedK8sConfigs,
+			expectedOutput:    "Error: deployment \"test\" does not exist\n",
 		},
 		{
 			description: "service without deployment",

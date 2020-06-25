@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,9 @@ import (
 	. "github.com/onsi/gomega"
 	"k8s.io/api/extensions/v1beta1"
 
+	"istio.io/istio/pkg/config/schema/resource"
+
+	appsV1 "k8s.io/api/apps/v1"
 	coreV1 "k8s.io/api/core/v1"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -35,7 +38,7 @@ func TestParse(t *testing.T) {
 		g := NewGomegaWithT(t)
 		input := data.GetEndpoints()
 
-		objMeta, objResource := parse(t, []byte(input), "", "Endpoints")
+		objMeta, objResource := parse(t, []byte(input), "", "Endpoints", "v1")
 
 		// Just validate a couple of things...
 		_, ok := objResource.(*coreV1.Endpoints)
@@ -49,7 +52,7 @@ func TestParse(t *testing.T) {
 		g := NewGomegaWithT(t)
 		input := data.GetNamespace()
 
-		objMeta, objResource := parse(t, []byte(input), "", "Namespace")
+		objMeta, objResource := parse(t, []byte(input), "", "Namespace", "v1")
 
 		// Just validate a couple of things...
 		_, ok := objResource.(*coreV1.NamespaceSpec)
@@ -63,7 +66,7 @@ func TestParse(t *testing.T) {
 		g := NewGomegaWithT(t)
 		input := data.GetIngress()
 
-		objMeta, objResource := parse(t, []byte(input), "extensions", "Ingress")
+		objMeta, objResource := parse(t, []byte(input), "extensions", "Ingress", "v1beta1")
 
 		// Just validate a couple of things...
 		_, ok := objResource.(*v1beta1.IngressSpec)
@@ -77,7 +80,7 @@ func TestParse(t *testing.T) {
 		g := NewGomegaWithT(t)
 		input := data.GetNode()
 
-		objMeta, objResource := parse(t, []byte(input), "", "Node")
+		objMeta, objResource := parse(t, []byte(input), "", "Node", "v1")
 
 		// Just validate a couple of things...
 		_, ok := objResource.(*coreV1.NodeSpec)
@@ -91,7 +94,7 @@ func TestParse(t *testing.T) {
 		g := NewGomegaWithT(t)
 		input := data.GetPod()
 
-		objMeta, objResource := parse(t, []byte(input), "", "Pod")
+		objMeta, objResource := parse(t, []byte(input), "", "Pod", "v1")
 
 		// Just validate a couple of things...
 		_, ok := objResource.(*coreV1.Pod)
@@ -105,7 +108,7 @@ func TestParse(t *testing.T) {
 		g := NewGomegaWithT(t)
 		input := data.GetService()
 
-		objMeta, objResource := parse(t, []byte(input), "", "Service")
+		objMeta, objResource := parse(t, []byte(input), "", "Service", "v1")
 
 		// Just validate a couple of things...
 		_, ok := objResource.(*coreV1.ServiceSpec)
@@ -114,13 +117,28 @@ func TestParse(t *testing.T) {
 		}
 		g.Expect(objMeta.GetName()).To(Equal("kube-dns"))
 	})
+
+	t.Run("Deployment", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		input := data.GetDeployment()
+
+		objMeta, objResource := parse(t, []byte(input), "apps", "Deployment", "v1")
+
+		// Just validate a couple of things...
+		_, ok := objResource.(*appsV1.Deployment)
+		if !ok {
+			t.Fatal("failed casting item to Deployment")
+		}
+		g.Expect(objMeta.GetName()).To(Equal("httpbin"))
+	})
+
 }
 
 func TestExtractObject(t *testing.T) {
-	for _, r := range k8smeta.MustGet().KubeSource().Resources() {
-		a := rt.DefaultProvider().GetAdapter(r)
+	for _, r := range k8smeta.MustGet().KubeCollections().All() {
+		a := rt.DefaultProvider().GetAdapter(r.Resource())
 
-		t.Run(r.Kind, func(t *testing.T) {
+		t.Run(r.Resource().Kind(), func(t *testing.T) {
 			t.Run("WrongTypeShouldReturnNil", func(t *testing.T) {
 				out := a.ExtractObject(struct{}{})
 				g := NewGomegaWithT(t)
@@ -128,7 +146,7 @@ func TestExtractObject(t *testing.T) {
 			})
 
 			t.Run("Success", func(t *testing.T) {
-				out := a.ExtractObject(empty(r.Kind))
+				out := a.ExtractObject(empty(r.Resource().Kind()))
 				g := NewGomegaWithT(t)
 				g.Expect(out).ToNot(BeNil())
 			})
@@ -137,10 +155,10 @@ func TestExtractObject(t *testing.T) {
 }
 
 func TestExtractResource(t *testing.T) {
-	for _, r := range k8smeta.MustGet().KubeSource().Resources() {
-		a := rt.DefaultProvider().GetAdapter(r)
+	for _, r := range k8smeta.MustGet().KubeCollections().All() {
+		a := rt.DefaultProvider().GetAdapter(r.Resource())
 
-		t.Run(r.Kind, func(t *testing.T) {
+		t.Run(r.Resource().Kind(), func(t *testing.T) {
 			t.Run("WrongTypeShouldReturnNil", func(t *testing.T) {
 				_, err := a.ExtractResource(struct{}{})
 				g := NewGomegaWithT(t)
@@ -148,7 +166,7 @@ func TestExtractResource(t *testing.T) {
 			})
 
 			t.Run("Success", func(t *testing.T) {
-				out, err := a.ExtractResource(empty(r.Kind))
+				out, err := a.ExtractResource(empty(r.Resource().Kind()))
 				g := NewGomegaWithT(t)
 				g.Expect(err).To(BeNil())
 				g.Expect(out).ToNot(BeNil())
@@ -157,12 +175,16 @@ func TestExtractResource(t *testing.T) {
 	}
 }
 
-func parse(t *testing.T, input []byte, group, kind string) (metaV1.Object, proto.Message) {
+func parse(t *testing.T, input []byte, group, kind, version string) (metaV1.Object, proto.Message) {
 	t.Helper()
 	g := NewGomegaWithT(t)
 
 	pr := rt.DefaultProvider()
-	a := pr.GetAdapter(k8smeta.MustGet().KubeSource().Resources().MustFind(group, kind))
+	a := pr.GetAdapter(k8smeta.MustGet().KubeCollections().MustFindByGroupVersionKind(resource.GroupVersionKind{
+		Group:   group,
+		Version: version,
+		Kind:    kind,
+	}).Resource())
 	obj, err := a.ParseJSON(input)
 	g.Expect(err).To(BeNil())
 
@@ -186,6 +208,8 @@ func empty(kind string) metaV1.Object {
 		return &coreV1.Namespace{}
 	case "Ingress":
 		return &v1beta1.Ingress{}
+	case "Deployment":
+		return &appsV1.Deployment{}
 	default:
 		panic(fmt.Sprintf("unsupported kind: %v", kind))
 	}

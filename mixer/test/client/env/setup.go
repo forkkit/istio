@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,15 @@ import (
 	"testing"
 	"time"
 
+	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	"github.com/golang/protobuf/jsonpb"
+
 	rpc "istio.io/gogo-genproto/googleapis/google/rpc"
+
+	// Import all XDS config types
+	_ "istio.io/istio/pkg/config/xds"
 
 	mixerpb "istio.io/api/mixer/v1"
 
@@ -47,6 +55,7 @@ type TestSetup struct {
 	noBackend         bool
 	disableHotRestart bool
 	checkDict         bool
+	silentlyStopProxy bool
 
 	FiltersBeforeMixer string
 
@@ -96,6 +105,21 @@ func (s *TestSetup) MfConfig() *MixerFilterConf {
 // Ports get ports object
 func (s *TestSetup) Ports() *Ports {
 	return s.ports
+}
+
+// SDSPath gets SDS path. The path does not change after proxy restarts.
+func (s *TestSetup) SDSPath() string {
+	return fmt.Sprintf("/tmp/sdstestudspath.%v", s.ports.MixerPort)
+}
+
+// JWTTokenPath gets JWT token path. The path does not change after proxy restarts.
+func (s *TestSetup) JWTTokenPath() string {
+	return fmt.Sprintf("/tmp/envoy-token-%v.jwt", s.ports.STSPort)
+}
+
+// CACertPath gets CA cert file path. The path does not change after proxy restarts.
+func (s *TestSetup) CACertPath() string {
+	return fmt.Sprintf("/tmp/ca-certificates-%v.crt", s.ports.STSPort)
 }
 
 // SetMixerCheckReferenced set Referenced in mocked Check response
@@ -156,6 +180,11 @@ func (s *TestSetup) SetCheckDict(checkDict bool) {
 // SetNoMixer set NoMixer flag
 func (s *TestSetup) SetNoMixer(no bool) {
 	s.noMixer = no
+}
+
+// SilentlyStopProxy ignores errors when stop proxy
+func (s *TestSetup) SilentlyStopProxy(silent bool) {
+	s.silentlyStopProxy = silent
 }
 
 // SetFiltersBeforeMixer sets the configurations of the filters before the Mixer filter
@@ -228,7 +257,7 @@ func (s *TestSetup) SetUp() error {
 
 // TearDown shutdown the servers.
 func (s *TestSetup) TearDown() {
-	if err := stopEnvoy(s.envoy); err != nil {
+	if err := stopEnvoy(s.envoy); err != nil && !s.silentlyStopProxy {
 		s.t.Errorf("error quitting envoy: %v", err)
 	}
 	removeEnvoySharedMemory(s.envoy)
@@ -359,9 +388,31 @@ func (s *TestSetup) WaitForStatsUpdateAndGetStats(waitDuration int) (string, err
 	return respBody, nil
 }
 
+// GetStatsMap fetches Envoy stats with retry, and returns stats in a map.
+func (s *TestSetup) GetStatsMap() (map[string]uint64, error) {
+	delay := 200 * time.Millisecond
+	total := 3 * time.Second
+	var errGet error
+	var code int
+	var statsJSON string
+	for attempt := 0; attempt < int(total/delay); attempt++ {
+		statsURL := fmt.Sprintf("http://localhost:%d/stats?format=json&usedonly", s.Ports().AdminPort)
+		code, statsJSON, errGet = HTTPGet(statsURL)
+		if errGet != nil {
+			log.Printf("sending stats request returns an error: %v", errGet)
+		} else if code != 200 {
+			log.Printf("sending stats request returns unexpected status code: %d", code)
+		} else {
+			return s.unmarshalStats(statsJSON), nil
+		}
+		time.Sleep(delay)
+	}
+	return nil, fmt.Errorf("failed to get stats, err: %v, code: %d", errGet, code)
+}
+
 type statEntry struct {
-	Name  string `json:"name"`
-	Value int    `json:"value"`
+	Name  string      `json:"name"`
+	Value json.Number `json:"value"`
 }
 
 type stats struct {
@@ -376,7 +427,7 @@ func (s *TestSetup) WaitEnvoyReady() {
 
 	delay := 200 * time.Millisecond
 	total := 3 * time.Second
-	var stats map[string]int
+	var stats map[string]uint64
 	for attempt := 0; attempt < int(total/delay); attempt++ {
 		statsURL := fmt.Sprintf("http://localhost:%d/stats?format=json&usedonly", s.Ports().AdminPort)
 		code, respBody, errGet := HTTPGet(statsURL)
@@ -396,25 +447,32 @@ func (s *TestSetup) WaitEnvoyReady() {
 
 // UnmarshalStats Unmarshals Envoy stats from JSON format into a map, where stats name is
 // key, and stats value is value.
-func (s *TestSetup) unmarshalStats(statsJSON string) map[string]int {
-	statsMap := make(map[string]int)
+func (s *TestSetup) unmarshalStats(statsJSON string) map[string]uint64 {
+	statsMap := make(map[string]uint64)
 
 	var statsArray stats
 	if err := json.Unmarshal([]byte(statsJSON), &statsArray); err != nil {
-		s.t.Fatalf("unable to unmarshal stats from json")
+		s.t.Fatalf("unable to unmarshal stats from json: %v", err)
 	}
 
 	for _, v := range statsArray.StatList {
-		statsMap[v.Name] = v.Value
+		if v.Value == "" {
+			continue
+		}
+		tmp, err := v.Value.Float64()
+		if err != nil {
+			s.t.Fatalf("unable to convert json.Number from stats: %v", err)
+		}
+		statsMap[v.Name] = uint64(tmp)
 	}
 	return statsMap
 }
 
 // VerifyStats verifies Envoy stats.
-func (s *TestSetup) VerifyStats(expectedStats map[string]int) {
+func (s *TestSetup) VerifyStats(expectedStats map[string]uint64) {
 	s.t.Helper()
 
-	check := func(actualStatsMap map[string]int) error {
+	check := func(actualStatsMap map[string]uint64) error {
 		for eStatsName, eStatsValue := range expectedStats {
 			aStatsValue, ok := actualStatsMap[eStatsName]
 			if !ok && eStatsValue != 0 {
@@ -455,7 +513,7 @@ func (s *TestSetup) VerifyStats(expectedStats map[string]int) {
 
 // VerifyStatsLT verifies that Envoy stats contains stat expectedStat, whose value is less than
 // expectedStatVal.
-func (s *TestSetup) VerifyStatsLT(actualStats string, expectedStat string, expectedStatVal int) {
+func (s *TestSetup) VerifyStatsLT(actualStats string, expectedStat string, expectedStatVal uint64) {
 	s.t.Helper()
 	actualStatsMap := s.unmarshalStats(actualStats)
 
@@ -487,4 +545,34 @@ func (s *TestSetup) DrainMixerAllChannels() {
 			<-s.mixer.quota.ch
 		}
 	}()
+}
+
+// go-control-plane requires v2 XDS types, when we are using v3 internally
+// nolint: interfacer
+func CastRouteToV2(r *route.RouteConfiguration) *v2.RouteConfiguration {
+	s, err := (&jsonpb.Marshaler{OrigName: true}).MarshalToString(r)
+	if err != nil {
+		panic(err.Error())
+	}
+	v2route := &v2.RouteConfiguration{}
+	err = jsonpb.UnmarshalString(s, v2route)
+	if err != nil {
+		panic(err.Error())
+	}
+	return v2route
+}
+
+// go-control-plane requires v2 XDS types, when we are using v3 internally
+// nolint: interfacer
+func CastListenerToV2(r *listener.Listener) *v2.Listener {
+	s, err := (&jsonpb.Marshaler{OrigName: true}).MarshalToString(r)
+	if err != nil {
+		panic(err.Error())
+	}
+	v2Listener := &v2.Listener{}
+	err = jsonpb.UnmarshalString(s, v2Listener)
+	if err != nil {
+		panic(err.Error())
+	}
+	return v2Listener
 }

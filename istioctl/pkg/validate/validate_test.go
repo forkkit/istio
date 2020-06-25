@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	mixervalidate "istio.io/istio/mixer/pkg/validate"
+	"istio.io/istio/pkg/test/env"
 )
 
 const (
@@ -81,82 +82,82 @@ metadata:
   selfLink: ""`
 	invalidSvcList = `
 apiVersion: v1
-items: 
-  - 
+items:
+  -
     apiVersion: v1
     kind: Service
-    metadata: 
+    metadata:
       name: details
-    spec: 
-      ports: 
-        - 
+    spec:
+      ports:
+        -
           name: details
           port: 9080
-  - 
+  -
     apiVersion: v1
     kind: Service
-    metadata: 
+    metadata:
       name: hello
-    spec: 
-      ports: 
-        - 
+    spec:
+      ports:
+        -
           port: 80
           protocol: TCP
 kind: List
-metadata: 
+metadata:
   resourceVersion: ""`
 	udpService = `
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
-    - 
+spec:
+  ports:
+    -
       protocol: udp`
 	skippedService = `
 kind: Service
-metadata: 
+metadata:
   name: hello
   namespace: istio-system
-spec: 
-  ports: 
-    - 
+spec:
+  ports:
+    -
       name: http
       port: 9080`
 	validPortNamingSvc = `
 apiVersion: v1
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
+spec:
+  ports:
     - name: http
       port: 9080`
 	validPortNamingWithSuffixSvc = `
 apiVersion: v1
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
+spec:
+  ports:
     - name: http-hello
       port: 9080`
 	invalidPortNamingSvc = `
 apiVersion: v1
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
+spec:
+  ports:
     - name: hello
       port: 9080`
 	portNameMissingSvc = `
 apiVersion: v1
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
+spec:
+  ports:
   - protocol: TCP`
 	validVirtualService = `
 apiVersion: networking.istio.io/v1alpha3
@@ -210,6 +211,14 @@ spec:
           host: c
           subset: v2
         weight: 25`
+	invalidVirtualServiceV1Beta1 = `
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: invalid-virtual-service
+spec:
+  http:
+`
 	validMixerRule = `
 apiVersion: "config.istio.io/v1alpha2"
 kind: rule
@@ -242,7 +251,7 @@ metadata:
   name: istio-system`
 	invalidMixerKind = `
 apiVersion: config.istio.io/v1alpha2
-kind: validator
+kind: instance
 metadata:
   name: invalid-kind
 spec:`
@@ -254,7 +263,7 @@ metadata:
 unexpected_junk:
    still_more_junk:
 spec:
-	host: productpage`
+  host: productpage`
 	versionLabelMissingDeployment = `
 apiVersion: apps/v1
 kind: Deployment
@@ -264,10 +273,33 @@ spec:`
 	skippedDeployment = `
 apiVersion: apps/v1
 kind: Deployment
-metadata: 
+metadata:
   name: hello
   namespace: istio-system
 spec: ~`
+	invalidIstioConfig = `
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  namespace: istio-system
+  name: example-istiocontrolplane
+spec:
+  dummy:
+  traffic_management:
+    components:
+    namespace: istio-traffic-management
+`
+	validIstioConfig = `
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  namespace: istio-system
+  name: example-istiocontrolplane
+spec:
+  addonComponents:
+    grafana:
+      enabled: true
+`
 )
 
 func fromYAML(in string) *unstructured.Unstructured {
@@ -277,6 +309,7 @@ func fromYAML(in string) *unstructured.Unstructured {
 	}
 	return &un
 }
+
 func TestValidateResource(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -291,6 +324,11 @@ func TestValidateResource(t *testing.T) {
 		{
 			name:  "invalid pilot configuration",
 			in:    invalidVirtualService,
+			valid: false,
+		},
+		{
+			name:  "invalid pilot configuration v1beta1",
+			in:    invalidVirtualServiceV1Beta1,
 			valid: false,
 		},
 		{
@@ -353,6 +391,16 @@ func TestValidateResource(t *testing.T) {
 			in:    udpService,
 			valid: true,
 		},
+		{
+			name:  "invalid Istio Operator config",
+			in:    invalidIstioConfig,
+			valid: false,
+		},
+		{
+			name:  "valid Istio Operator config",
+			in:    validIstioConfig,
+			valid: true,
+		},
 	}
 
 	for i, c := range cases {
@@ -362,9 +410,24 @@ func TestValidateResource(t *testing.T) {
 			}
 			err := v.validateResource("istio-system", fromYAML(c.in))
 			if (err == nil) != c.valid {
-				tt.Fatalf("unexpected validation result: got %v want %v: err=%q", err == nil, c.valid, err)
+				tt.Fatalf("unexpected validation result: got %v want %v: err=%v", err == nil, c.valid, err)
 			}
 		})
+	}
+}
+
+func TestValidateFiles(t *testing.T) {
+	files := []string{
+		env.IstioSrc + "/mixer/testdata/config/attributes.yaml",
+		env.IstioSrc + "/mixer/template/metric/template.yaml",
+		env.IstioSrc + "/mixer/test/prometheus/prometheus-nosession.yaml",
+		env.IstioSrc + "/samples/httpbin/policy/keyval-template.yaml",
+		env.IstioSrc + "/samples/bookinfo/policy/mixer-rule-deny-ip-crd.yaml",
+	}
+	istioNamespace := "istio-system"
+	b := bytes.Buffer{}
+	if err := validateFiles(&istioNamespace, files, true, &b); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -499,9 +562,10 @@ $`),
 			wantError: true,
 		},
 		{
-			name:      "invalid top-level key",
-			args:      []string{"--filename", unsupportedKeyFilename},
-			wantError: true,
+			name:           "invalid top-level key",
+			args:           []string{"--filename", unsupportedKeyFilename},
+			expectedRegexp: regexp.MustCompile(`.*unknown field "unexpected_junk"`),
+			wantError:      true,
 		},
 		{
 			name:      "version label missing deployment",

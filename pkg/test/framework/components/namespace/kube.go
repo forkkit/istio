@@ -1,4 +1,4 @@
-//  Copyright 2019 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -21,10 +21,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
+
+	"istio.io/api/label"
+
 	"istio.io/istio/pkg/test/framework/components/environment/kube"
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/resource"
-	k "istio.io/istio/pkg/test/kube"
+	kube2 "istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/scopes"
 )
 
@@ -38,12 +42,28 @@ var (
 type kubeNamespace struct {
 	id   resource.ID
 	name string
-	a    *k.Accessor
+	env  *kube.Environment
+	ctx  resource.Context
+}
+
+func (n *kubeNamespace) Dump() {
+	scopes.Framework.Errorf("=== Dumping Namespace %s State...", n.name)
+
+	d, err := n.ctx.CreateTmpDirectory(n.name + "-state")
+	if err != nil {
+		scopes.Framework.Errorf("Unable to create directory for dumping %s contents: %v", n.name, err)
+		return
+	}
+
+	for _, cluster := range n.env.KubeClusters {
+		kube2.DumpPods(cluster, d, n.name)
+	}
 }
 
 var _ Instance = &kubeNamespace{}
 var _ io.Closer = &kubeNamespace{}
 var _ resource.Resource = &kubeNamespace{}
+var _ resource.Dumper = &kubeNamespace{}
 
 func (n *kubeNamespace) Name() string {
 	return n.name
@@ -59,30 +79,34 @@ func (n *kubeNamespace) Close() (err error) {
 		scopes.Framework.Debugf("%s deleting namespace", n.id)
 		ns := n.name
 		n.name = ""
-		err = n.a.DeleteNamespace(ns)
+
+		for _, cluster := range n.env.KubeClusters {
+			err = multierror.Append(err, cluster.DeleteNamespace(ns)).ErrorOrNil()
+		}
 	}
 
 	scopes.Framework.Debugf("%s close complete (err:%v)", n.id, err)
 	return
 }
 
-func claimKube(ctx resource.Context, name string) (Instance, error) {
+func claimKube(ctx resource.Context, name string, injectSidecar bool) (Instance, error) {
 	env := ctx.Environment().(*kube.Environment)
 	cfg, err := istio.DefaultConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	if !env.Accessor.NamespaceExists(name) {
-		nsConfig := Config{
-			Inject:                  true,
-			CustomInjectorNamespace: cfg.CustomSidecarInjectorNamespace,
+	for _, cluster := range env.KubeClusters {
+		if !cluster.NamespaceExists(name) {
+			nsConfig := Config{
+				Inject:   injectSidecar,
+				Revision: cfg.CustomSidecarInjectorNamespace,
+			}
+			nsLabels := createNamespaceLabels(&nsConfig)
+			if err := cluster.CreateNamespaceWithLabels(name, "istio-test", nsLabels); err != nil {
+				return nil, err
+			}
 		}
-		nsLabels := createNamespaceLabels(&nsConfig)
-		if err := env.CreateNamespaceWithLabels(name, "istio-test", nsLabels); err != nil {
-			return nil, err
-		}
-
 	}
 	return &kubeNamespace{name: name}, nil
 }
@@ -95,17 +119,21 @@ func newKube(ctx resource.Context, nsConfig *Config) (Instance, error) {
 	r := rnd.Intn(99999)
 	mu.Unlock()
 
-	env := ctx.Environment().(*kube.Environment)
 	ns := fmt.Sprintf("%s-%d-%d", nsConfig.Prefix, nsid, r)
-
-	nsLabels := createNamespaceLabels(nsConfig)
-	if err := env.CreateNamespaceWithLabels(ns, "istio-test", nsLabels); err != nil {
-		return nil, err
+	n := &kubeNamespace{
+		name: ns,
+		env:  ctx.Environment().(*kube.Environment),
+		ctx:  ctx,
 	}
-
-	n := &kubeNamespace{name: ns, a: env.Accessor}
 	id := ctx.TrackResource(n)
 	n.id = id
+
+	for _, cluster := range n.env.KubeClusters {
+		nsLabels := createNamespaceLabels(nsConfig)
+		if err := cluster.CreateNamespaceWithLabels(ns, "istio-test", nsLabels); err != nil {
+			return nil, err
+		}
+	}
 
 	return n, nil
 }
@@ -114,9 +142,10 @@ func newKube(ctx resource.Context, nsConfig *Config) (Instance, error) {
 func createNamespaceLabels(cfg *Config) map[string]string {
 	l := make(map[string]string)
 	if cfg.Inject {
-		l["istio-injection"] = "enabled"
-		if cfg.CustomInjectorNamespace != "" {
-			l["istio-env"] = cfg.CustomInjectorNamespace
+		if cfg.Revision != "" {
+			l[label.IstioRev] = cfg.Revision
+		} else {
+			l["istio-injection"] = "enabled"
 		}
 	}
 

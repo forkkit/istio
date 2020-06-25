@@ -29,19 +29,14 @@ set -u
 # Print commands
 set -x
 
+
 # shellcheck source=prow/lib.sh
 source "${ROOT}/prow/lib.sh"
 setup_and_export_git_sha
 
-function build_kind_images() {
-  # Build just the images needed for the tests
-  for image in pilot proxyv2 app test_policybackend mixer citadel galley sidecar_injector kubectl node-agent-k8s; do
-     make docker.${image}
-  done
-	# Archived local images and load it into KinD's docker daemon
-	# Kubernetes in KinD can only access local images from its docker daemon.
-	docker images "${HUB}/*:${TAG}" --format '{{.Repository}}:{{.Tag}}' | xargs -n1 -P16 kind --loglevel debug --name istio-testing load docker-image
-}
+TOPOLOGY=SINGLE_CLUSTER
+
+PARAMS=()
 
 while (( "$#" )); do
   case "$1" in
@@ -63,6 +58,24 @@ while (( "$#" )); do
       SKIP_BUILD=true
       shift
     ;;
+    --manual)
+      MANUAL=true
+      shift
+    ;;
+    --topology)
+      case $2 in
+        # TODO(landow) get rid of MULTICLUSTER_SINGLE_NETWORK after updating Prow job
+        SINGLE_CLUSTER | MULTICLUSTER_SINGLE_NETWORK | MULTICLUSTER )
+          TOPOLOGY=$2
+          echo "Running with topology ${TOPOLOGY}"
+          ;;
+        *)
+          echo "Error: Unsupported topology ${TOPOLOGY}" >&2
+          exit 1
+          ;;
+      esac
+      shift 2
+    ;;
     -*)
       echo "Error: Unsupported flag $1" >&2
       exit 1
@@ -74,7 +87,6 @@ while (( "$#" )); do
   esac
 done
 
-
 # KinD will not have a LoadBalancer, so we need to disable it
 export TEST_ENV=kind
 
@@ -85,18 +97,51 @@ export PULL_POLICY=IfNotPresent
 export HUB=${HUB:-"istio-testing"}
 export TAG="${TAG:-"istio-testing"}"
 
+# Default IP family of the cluster is IPv4
+export IP_FAMILY="${IP_FAMILY:-ipv4}"
+
 # Setup junit report and verbose logging
-export JUNIT_UNIT_TEST_XML="${ARTIFACTS:-$(mktemp -d)}/junit.xml"
 export T="${T:-"-v"}"
+export CI="true"
 
 make init
 
 if [[ -z "${SKIP_SETUP:-}" ]]; then
-  time setup_kind_cluster "${NODE_IMAGE:-}"
+  if [[ "${TOPOLOGY}" == "SINGLE_CLUSTER" ]]; then
+    time setup_kind_cluster "${IP_FAMILY}" "${NODE_IMAGE:-}"
+  else
+    # TODO: Support IPv6 multicluster
+    time setup_kind_clusters "${TOPOLOGY}" "${NODE_IMAGE:-}"
+
+    # Set the kube configs to point to the clusters.
+    export INTEGRATION_TEST_KUBECONFIG="${CLUSTER1_KUBECONFIG},${CLUSTER2_KUBECONFIG},${CLUSTER3_KUBECONFIG}"
+    export INTEGRATION_TEST_NETWORKS="0:test-network-0,1:test-network-0,2:test-network-1"
+  fi
 fi
 
 if [[ -z "${SKIP_BUILD:-}" ]]; then
-  time build_kind_images
+  time build_images "${PARAMS[*]}"
+
+  if [[ "${TOPOLOGY}" == "SINGLE_CLUSTER" ]]; then
+    time kind_load_images ""
+  else
+    time kind_load_images_on_clusters
+  fi
 fi
 
-make "${PARAMS[*]}"
+# If a variant is defined, update the tag accordingly
+if [[ -n "${VARIANT:-}" ]]; then
+  export TAG="${TAG}-${VARIANT}"
+fi
+
+# Run the test target if provided.
+if [[ -n "${PARAMS:-}" ]]; then
+  make "${PARAMS[*]}"
+fi
+
+# Check if the user is running the clusters in manual mode.
+if [[ -n "${MANUAL:-}" ]]; then
+  echo "Running cluster(s) in manual mode. Press any key to shutdown and exit..."
+  read -rsn1
+  exit 0
+fi

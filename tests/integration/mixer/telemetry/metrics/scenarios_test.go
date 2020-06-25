@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,11 +20,8 @@ import (
 
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/bookinfo"
-	"istio.io/istio/pkg/test/framework/components/environment"
-	"istio.io/istio/pkg/test/framework/components/galley"
 	"istio.io/istio/pkg/test/framework/components/ingress"
 	"istio.io/istio/pkg/test/framework/components/istio"
-	"istio.io/istio/pkg/test/framework/components/mixer"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/components/prometheus"
 	"istio.io/istio/pkg/test/framework/label"
@@ -36,7 +33,6 @@ import (
 var (
 	ist        istio.Instance
 	bookinfoNs namespace.Instance
-	g          galley.Instance
 	ing        ingress.Instance
 	prom       prometheus.Instance
 )
@@ -49,7 +45,6 @@ func TestIngessToPrometheus_ServiceMetric(t *testing.T) {
 		NewTest(t).
 		// TODO(https://github.com/istio/istio/issues/14819)
 		Label(label.Flaky).
-		RequiresEnvironment(environment.Kube).
 		Run(func(ctx framework.TestContext) {
 			label := "source_workload"
 			labelValue := "istio-ingressgateway"
@@ -61,24 +56,26 @@ func TestIngessToPrometheus_ServiceMetric(t *testing.T) {
 func TestIngessToPrometheus_IngressMetric(t *testing.T) {
 	framework.
 		NewTest(t).
-		RequiresEnvironment(environment.Kube).
 		Run(func(ctx framework.TestContext) {
-			label := "destination_service"
-			labelValue := "productpage.{{.TestNamespace}}.svc.cluster.local"
-			testMetric(t, ctx, label, labelValue)
+			ctx.NewSubTest("SetupAndPrometheus").
+				Run(func(ctx framework.TestContext) {
+					label := "destination_service"
+					labelValue := "productpage.{{.TestNamespace}}.svc.cluster.local"
+					testMetric(t, ctx, label, labelValue)
+				})
 		})
 }
 
 func testMetric(t *testing.T, ctx framework.TestContext, label string, labelValue string) { // nolint:interfacer
 	t.Helper()
-	g.ApplyConfigOrFail(
+	ctx.ApplyConfigOrFail(
 		t,
-		bookinfoNs,
+		bookinfoNs.Name(),
 		bookinfo.GetDestinationRuleConfigFileOrFail(t, ctx).LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 		bookinfo.NetworkingVirtualServiceAllV1.LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 	)
-	defer g.DeleteConfigOrFail(t,
-		bookinfoNs,
+	defer ctx.DeleteConfigOrFail(t,
+		bookinfoNs.Name(),
 		bookinfo.GetDestinationRuleConfigFileOrFail(t, ctx).LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 		bookinfo.NetworkingVirtualServiceAllV1.LoadWithNamespaceOrFail(t, bookinfoNs.Name()))
 
@@ -126,60 +123,33 @@ func testMetric(t *testing.T, ctx framework.TestContext, label string, labelValu
 		t.Fatal(err)
 	}
 
-	// We shold see 10 requests but giving an error of 1, to make test less flaky.
+	// We should see 10 requests but giving an error of 1, to make test less flaky.
 	if (f - i) < float64(9) {
 		t.Errorf("Bad metric value: got %f, want at least 9", f-i)
 	}
-}
-
-func TestStateMetrics(t *testing.T) {
-	framework.
-		NewTest(t).
-		RequiresEnvironment(environment.Kube).
-		Run(func(ctx framework.TestContext) {
-			g.ApplyConfigOrFail(
-				t,
-				bookinfoNs,
-				bookinfo.GetDestinationRuleConfigFileOrFail(t, ctx).LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
-				bookinfo.NetworkingVirtualServiceAllV1.LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
-			)
-			defer g.DeleteConfigOrFail(t,
-				bookinfoNs,
-				bookinfo.GetDestinationRuleConfigFileOrFail(t, ctx).LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
-				bookinfo.NetworkingVirtualServiceAllV1.LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
-			)
-
-			util.AllowRuleSync(t)
-
-			query := fmt.Sprintf("sum(galley_istio_networking_destinationrules{namespace=\"%s\",version=\"v1alpha3\"})", bookinfoNs.Name())
-			util.ValidateMetric(t, prom, query, "galley_istio_networking_destinationrules", 4)
-
-			query = fmt.Sprintf("sum(galley_istio_networking_virtualservices{namespace=\"%s\"})", bookinfoNs.Name())
-			util.ValidateMetric(t, prom, query, "galley_istio_networking_virtualservices", 5)
-
-			query = fmt.Sprintf("sum(galley_istio_networking_gateways{namespace=\"%s\"})", bookinfoNs.Name())
-			util.ValidateMetric(t, prom, query, "galley_istio_networking_gateways", 1)
-		})
 }
 
 // Port of TestTcpMetric
 func TestTcpMetric(t *testing.T) {
 	framework.
 		NewTest(t).
-		RequiresEnvironment(environment.Kube).
+		// TODO(https://github.com/istio/istio/issues/18105)
+		Label(label.Flaky).
 		Run(func(ctx framework.TestContext) {
-			_ = bookinfo.DeployOrFail(t, ctx, bookinfo.Config{Namespace: bookinfoNs, Cfg: bookinfo.BookinfoRatingsv2})
-			_ = bookinfo.DeployOrFail(t, ctx, bookinfo.Config{Namespace: bookinfoNs, Cfg: bookinfo.BookinfoDb})
+			undeploy1 := bookinfo.DeployOrFail(t, ctx, bookinfo.Config{Namespace: bookinfoNs, Cfg: bookinfo.BookinfoRatingsv2})
+			undeploy2 := bookinfo.DeployOrFail(t, ctx, bookinfo.Config{Namespace: bookinfoNs, Cfg: bookinfo.BookinfoDB})
+			defer undeploy1()
+			defer undeploy2()
 
-			g.ApplyConfigOrFail(
+			ctx.ApplyConfigOrFail(
 				t,
-				bookinfoNs,
+				bookinfoNs.Name(),
 				bookinfo.GetDestinationRuleConfigFileOrFail(t, ctx).LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 				bookinfo.NetworkingTCPDbRule.LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 			)
-			defer g.DeleteConfigOrFail(
+			defer ctx.DeleteConfigOrFail(
 				t,
-				bookinfoNs,
+				bookinfoNs.Name(),
 				bookinfo.GetDestinationRuleConfigFileOrFail(t, ctx).LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 				bookinfo.NetworkingTCPDbRule.LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 			)
@@ -209,9 +179,27 @@ func TestTcpMetric(t *testing.T) {
 
 func TestMain(m *testing.M) {
 	framework.
-		NewSuite("mixer_telemetry_metrics", m).
-		RequireEnvironment(environment.Kube).
-		SetupOnEnv(environment.Kube, istio.Setup(&ist, nil)).
+		NewSuite(m).
+		RequireSingleCluster().
+		Label(label.CustomSetup).
+		Setup(istio.Setup(&ist, func(cfg *istio.Config) {
+			cfg.ControlPlaneValues = `
+values:
+  prometheus:	
+    enabled: true
+  meshConfig:
+    disablePolicyChecks: false
+  telemetry:
+    v1:
+      enabled: true
+    v2:
+      enabled: false
+components:
+  policy:
+    enabled: true
+  telemetry:
+    enabled: true`
+		})).
 		Setup(testsetup).
 		Run()
 }
@@ -227,18 +215,13 @@ func testsetup(ctx resource.Context) (err error) {
 	if _, err := bookinfo.Deploy(ctx, bookinfo.Config{Namespace: bookinfoNs, Cfg: bookinfo.BookInfo}); err != nil {
 		return err
 	}
-	g, err = galley.New(ctx, galley.Config{})
-	if err != nil {
-		return err
-	}
-	if _, err = mixer.New(ctx, mixer.Config{Galley: g}); err != nil {
-		return err
-	}
 	ing, err = ingress.New(ctx, ingress.Config{Istio: ist})
 	if err != nil {
 		return err
 	}
-	prom, err = prometheus.New(ctx)
+	prom, err = prometheus.New(ctx, prometheus.Config{
+		SkipDeploy: true, // Use istioctl prometheus; sample prometheus does not support mixer.
+	})
 	if err != nil {
 		return err
 	}
@@ -246,7 +229,7 @@ func testsetup(ctx resource.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	err = g.ApplyConfig(bookinfoNs, yamlText)
+	err = ctx.ApplyConfig(bookinfoNs.Name(), yamlText)
 	if err != nil {
 		return err
 	}

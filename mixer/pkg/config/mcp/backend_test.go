@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -28,10 +28,9 @@ import (
 
 	"istio.io/api/policy/v1beta1"
 
-	"istio.io/istio/galley/pkg/config/meta/metadata"
-	"istio.io/istio/galley/pkg/config/meta/schema"
 	"istio.io/istio/mixer/pkg/config/store"
 	"istio.io/istio/mixer/pkg/runtime/config/constant"
+	"istio.io/istio/pkg/config/schema"
 	"istio.io/istio/pkg/mcp/snapshot"
 	"istio.io/istio/pkg/mcp/source"
 	mcptest "istio.io/istio/pkg/mcp/testing"
@@ -74,9 +73,9 @@ func init() {
 }
 
 func collectionOf(nonLegacyKind string) string { // nolint: unparam
-	for _, r := range metadata.MustGet().KubeSource().Resources() {
-		if r.Kind == nonLegacyKind {
-			return metadata.MustGet().DirectTransformSettings().Mapping()[r.Collection.Name].String()
+	for _, r := range schema.MustGet().KubeCollections().All() {
+		if r.Resource().Kind() == nonLegacyKind {
+			return schema.MustGet().DirectTransformSettings().Mapping()[r.Name()].String()
 		}
 	}
 
@@ -99,7 +98,7 @@ func createState(t *testing.T) *testState {
 
 	var collections []source.CollectionOptions
 	var kinds []string
-	m, err := schema.ConstructKindMapping(mixerKinds, metadata.MustGet())
+	m, err := schema.ConstructKindMapping(mixerKinds, schema.MustGet())
 	if err != nil {
 		t.Fatal(err)
 	}

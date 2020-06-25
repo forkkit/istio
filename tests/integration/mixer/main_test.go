@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -17,8 +17,9 @@ package mixer
 import (
 	"testing"
 
+	"istio.io/istio/pkg/test/framework/label"
+
 	"istio.io/istio/pkg/test/framework"
-	"istio.io/istio/pkg/test/framework/components/environment"
 	"istio.io/istio/pkg/test/framework/components/istio"
 )
 
@@ -27,7 +28,24 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	framework.NewSuite("mixer_test", m).
-		SetupOnEnv(environment.Kube, istio.Setup(&ist, nil)).
+	framework.NewSuite(m).
+		Label(label.CustomSetup).
+		RequireSingleCluster().
+		Setup(istio.Setup(&ist, func(cfg *istio.Config) {
+			cfg.ControlPlaneValues = `
+values:
+  meshConfig:
+    disablePolicyChecks: false
+  telemetry:
+    v1:
+      enabled: true
+    v2:
+      enabled: false
+components:
+  policy:
+    enabled: true
+  telemetry:
+    enabled: true`
+		})).
 		Run()
 }

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	"github.com/golang/protobuf/ptypes"
 	. "github.com/onsi/gomega"
 
@@ -127,7 +127,7 @@ func TestStartWithBadBinaryShouldFail(t *testing.T) {
 	defer h.Close()
 
 	i := h.NewOrFail(t, envoy.Config{
-		BinaryPath: absPath("testdata/envoy_bootstrap_v2.json"), // Not a binary file.
+		BinaryPath: absPath("testdata/envoy_bootstrap.json"), // Not a binary file.
 		Options:    options(envoy.ConfigYaml(h.BootstrapContent(t))),
 	})
 
@@ -412,7 +412,7 @@ func TestConfigDump(t *testing.T) {
 
 	// Basic verification of the config dump..
 	for _, c := range cd.Configs {
-		if c.TypeUrl == "type.googleapis.com/envoy.admin.v2alpha.BootstrapConfigDump" {
+		if c.TypeUrl == "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump" {
 			b := envoyAdmin.BootstrapConfigDump{}
 			g.Expect(ptypes.UnmarshalAny(c, &b)).To(BeNil())
 

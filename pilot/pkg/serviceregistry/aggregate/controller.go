@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@ package aggregate
 import (
 	"sync"
 
+	"istio.io/istio/pilot/pkg/features"
+
 	"github.com/hashicorp/go-multierror"
 
 	"istio.io/pkg/log"
@@ -27,39 +29,30 @@ import (
 	"istio.io/istio/pkg/config/labels"
 )
 
-// Registry specifies the collection of service registry related interfaces
-type Registry struct {
-	// Name is the type of the registry - Kubernetes, Consul, etc.
-	Name serviceregistry.ServiceRegistry
-	// ClusterID is used when multiple registries of the same type are used,
-	// for example in the case of K8S multicluster.
-	ClusterID string
-	model.Controller
-	model.ServiceDiscovery
-}
-
-// TODO: rename Name to Type and ClusterID to Name ?
-
 var (
 	clusterAddressesMutex sync.Mutex
 )
 
+// The aggregate controller does not implement serviceregistry.Instance since it may be comprised of various
+// providers and clusters.
+var _ model.ServiceDiscovery = &Controller{}
+var _ model.Controller = &Controller{}
+
 // Controller aggregates data across different registries and monitors for changes
 type Controller struct {
-	registries []Registry
+	registries []serviceregistry.Instance
 	storeLock  sync.RWMutex
 }
 
 // NewController creates a new Aggregate controller
 func NewController() *Controller {
-
 	return &Controller{
-		registries: []Registry{},
+		registries: make([]serviceregistry.Instance, 0),
 	}
 }
 
 // AddRegistry adds registries into the aggregated controller
-func (c *Controller) AddRegistry(registry Registry) {
+func (c *Controller) AddRegistry(registry serviceregistry.Instance) {
 	c.storeLock.Lock()
 	defer c.storeLock.Unlock()
 
@@ -89,7 +82,7 @@ func (c *Controller) DeleteRegistry(clusterID string) {
 }
 
 // GetRegistries returns a copy of all registries
-func (c *Controller) GetRegistries() []Registry {
+func (c *Controller) GetRegistries() []serviceregistry.Instance {
 	c.storeLock.RLock()
 	defer c.storeLock.RUnlock()
 
@@ -99,7 +92,7 @@ func (c *Controller) GetRegistries() []Registry {
 // GetRegistryIndex returns the index of a registry
 func (c *Controller) GetRegistryIndex(clusterID string) (int, bool) {
 	for i, r := range c.registries {
-		if r.ClusterID == clusterID {
+		if r.Cluster() == clusterID {
 			return i, true
 		}
 	}
@@ -124,8 +117,8 @@ func (c *Controller) Services() ([]*model.Service, error) {
 		// Race condition: multiple threads may call Services, and multiple services
 		// may modify one of the service's cluster ID
 		clusterAddressesMutex.Lock()
-		if r.ClusterID == "" { // Should we instead check for registry name to be on safe side?
-			// If the service is does not have a cluster ID (consul, ServiceEntries, CloudFoundry, etc.)
+		if r.Cluster() == "" { // Should we instead check for registry name to be on safe side?
+			// If the service does not have a cluster ID (consul, ServiceEntries, CloudFoundry, etc.)
 			// Do not bother checking for the cluster ID.
 			// DO NOT ASSIGN CLUSTER ID to non-k8s registries. This will prevent service entries with multiple
 			// VIPs or CIDR ranges in the address field
@@ -150,14 +143,7 @@ func (c *Controller) Services() ([]*model.Service, error) {
 				if sp.ClusterVIPs == nil {
 					sp.ClusterVIPs = make(map[string]string)
 				}
-				sp.ClusterVIPs[r.ClusterID] = s.Address
-
-				if s.Attributes.ClusterExternalAddresses != nil && len(s.Attributes.ClusterExternalAddresses[r.ClusterID]) > 0 {
-					if sp.Attributes.ClusterExternalAddresses == nil {
-						sp.Attributes.ClusterExternalAddresses = make(map[string][]string)
-					}
-					sp.Attributes.ClusterExternalAddresses[r.ClusterID] = s.Attributes.ClusterExternalAddresses[r.ClusterID]
-				}
+				sp.ClusterVIPs[r.Cluster()] = s.Address
 				sp.Mutex.Unlock()
 			}
 		}
@@ -167,43 +153,52 @@ func (c *Controller) Services() ([]*model.Service, error) {
 }
 
 // GetService retrieves a service by hostname if exists
+// Currently only used to get get gateway service
+// TODO: merge with Services()
 func (c *Controller) GetService(hostname host.Name) (*model.Service, error) {
 	var errs error
+	var out *model.Service
 	for _, r := range c.GetRegistries() {
 		service, err := r.GetService(hostname)
 		if err != nil {
 			errs = multierror.Append(errs, err)
-		} else if service != nil {
-			if errs != nil {
-				log.Warnf("GetService() found match but encountered an error: %v", errs)
-			}
+			continue
+		}
+		if service == nil {
+			continue
+		}
+		if r.Cluster() == "" { // Should we instead check for registry name to be on safe side?
+			// If the service does not have a cluster ID (consul, ServiceEntries, CloudFoundry, etc.)
+			// Do not bother checking for the cluster ID.
+			// DO NOT ASSIGN CLUSTER ID to non-k8s registries. This will prevent service entries with multiple
+			// VIPs or CIDR ranges in the address field
 			return service, nil
 		}
 
-	}
-	return nil, errs
-}
-
-// ManagementPorts retrieves set of health check ports by instance IP
-// Return on the first hit.
-func (c *Controller) ManagementPorts(addr string) model.PortList {
-	for _, r := range c.GetRegistries() {
-		if portList := r.ManagementPorts(addr); portList != nil {
-			return portList
+		// This is K8S typically
+		if out == nil {
+			out = service.DeepCopy()
+		} else {
+			service.Mutex.RLock()
+			// ClusterExternalAddresses and ClusterExternalPorts are only used for getting gateway address
+			externalAddrs := service.Attributes.ClusterExternalAddresses[r.Cluster()]
+			if len(externalAddrs) > 0 {
+				if out.Attributes.ClusterExternalAddresses == nil {
+					out.Attributes.ClusterExternalAddresses = make(map[string][]string)
+				}
+				out.Attributes.ClusterExternalAddresses[r.Cluster()] = externalAddrs
+			}
+			externalPorts := service.Attributes.ClusterExternalPorts[r.Cluster()]
+			if len(externalPorts) > 0 {
+				if out.Attributes.ClusterExternalPorts == nil {
+					out.Attributes.ClusterExternalPorts = make(map[string]map[uint32]uint32)
+				}
+				out.Attributes.ClusterExternalPorts[r.Cluster()] = externalPorts
+			}
+			service.Mutex.RUnlock()
 		}
 	}
-	return nil
-}
-
-// WorkloadHealthCheckInfo returne the health check information for IP addr
-// Return on the first hit.
-func (c *Controller) WorkloadHealthCheckInfo(addr string) model.ProbeList {
-	for _, r := range c.GetRegistries() {
-		if probeList := r.WorkloadHealthCheckInfo(addr); probeList != nil {
-			return probeList
-		}
-	}
-	return nil
+	return out, errs
 }
 
 // InstancesByPort retrieves instances for a service on a given port that match
@@ -216,11 +211,9 @@ func (c *Controller) InstancesByPort(svc *model.Service, port int,
 		var err error
 		tmpInstances, err = r.InstancesByPort(svc, port, labels)
 		if err != nil {
+			log.Warnf("get service %s instance from registry %s/%s failed: %v", svc.Hostname, r.Provider(), r.Cluster(), err)
 			errs = multierror.Append(errs, err)
 		} else if len(tmpInstances) > 0 {
-			if errs != nil {
-				log.Warnf("Instances() found match but encountered an error: %v", errs)
-			}
 			instances = append(instances, tmpInstances...)
 		}
 	}
@@ -230,6 +223,32 @@ func (c *Controller) InstancesByPort(svc *model.Service, port int,
 	return instances, errs
 }
 
+func nodeClusterID(node *model.Proxy) string {
+	if node.Metadata == nil || node.Metadata.ClusterID == "" {
+		return ""
+	}
+	return node.Metadata.ClusterID
+}
+
+// Skip the service registry when there won't be a match
+// because the proxy is in a different cluster.
+func skipSearchingRegistryForProxy(nodeClusterID, registryClusterID, selfClusterID string) bool {
+	// We can't trust the default service registry because its always
+	// named `Kubernetes`. Use the `CLUSTER_ID` envvar to find the
+	// local cluster name in these cases.
+	// TODO(https://github.com/istio/istio/issues/22093)
+	if registryClusterID == string(serviceregistry.Kubernetes) {
+		registryClusterID = selfClusterID
+	}
+
+	// We can't be certain either way
+	if registryClusterID == "" || nodeClusterID == "" {
+		return false
+	}
+
+	return registryClusterID != nodeClusterID
+}
+
 // GetProxyServiceInstances lists service instances co-located with a given proxy
 func (c *Controller) GetProxyServiceInstances(node *model.Proxy) ([]*model.ServiceInstance, error) {
 	out := make([]*model.ServiceInstance, 0)
@@ -237,12 +256,18 @@ func (c *Controller) GetProxyServiceInstances(node *model.Proxy) ([]*model.Servi
 	// It doesn't make sense for a single proxy to be found in more than one registry.
 	// TODO: if otherwise, warning or else what to do about it.
 	for _, r := range c.GetRegistries() {
+		nodeClusterID := nodeClusterID(node)
+		if skipSearchingRegistryForProxy(nodeClusterID, r.Cluster(), features.ClusterName) {
+			log.Debugf("GetProxyServiceInstances(): not searching registry %v: proxy %v CLUSTER_ID is %v",
+				r.Cluster(), node.ID, nodeClusterID)
+			continue
+		}
+
 		instances, err := r.GetProxyServiceInstances(node)
 		if err != nil {
 			errs = multierror.Append(errs, err)
 		} else if len(instances) > 0 {
 			out = append(out, instances...)
-			node.ClusterID = r.ClusterID
 			break
 		}
 	}
@@ -293,11 +318,21 @@ func (c *Controller) Run(stop <-chan struct{}) {
 	log.Info("Registry Aggregator terminated")
 }
 
+// HasSynced returns true when all registries have synced
+func (c *Controller) HasSynced() bool {
+	for _, r := range c.GetRegistries() {
+		if !r.HasSynced() {
+			return false
+		}
+	}
+	return true
+}
+
 // AppendServiceHandler implements a service catalog operation
 func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) error {
 	for _, r := range c.GetRegistries() {
 		if err := r.AppendServiceHandler(f); err != nil {
-			log.Infof("Fail to append service handler to adapter %s", r.Name)
+			log.Infof("Fail to append service handler to adapter %s", r.Provider())
 			return err
 		}
 	}
@@ -308,7 +343,7 @@ func (c *Controller) AppendServiceHandler(f func(*model.Service, model.Event)) e
 func (c *Controller) AppendInstanceHandler(f func(*model.ServiceInstance, model.Event)) error {
 	for _, r := range c.GetRegistries() {
 		if err := r.AppendInstanceHandler(f); err != nil {
-			log.Infof("Fail to append instance handler to adapter %s", r.Name)
+			log.Infof("Fail to append instance handler to adapter %s", r.Provider())
 			return err
 		}
 	}

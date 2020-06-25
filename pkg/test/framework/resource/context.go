@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,21 +14,25 @@
 
 package resource
 
-import (
-	"istio.io/istio/pkg/test/framework/core"
-)
-
 // Context is the core context interface that is used by resources.
 type Context interface {
+	ConfigManager
+
 	// TrackResource tracks a resource in this context. If the context is closed, then the resource will be
 	// cleaned up.
 	TrackResource(r Resource) ID
+
+	// GetResource accepts either a *T or *[]*T where T implements Resource.
+	// For a non-slice pointer, the value will be assigned to the first matching resource.
+	// For a slice pointer, the matching resources will be appended.
+	// If ref is not a pointer, an error will be returned.
+	GetResource(ref interface{}) error
 
 	// The Environment in which the tests run
 	Environment() Environment
 
 	// Settings returns common settings
-	Settings() *core.Settings
+	Settings() *Settings
 
 	// CreateDirectory creates a new subdirectory within this context.
 	CreateDirectory(name string) (string, error)

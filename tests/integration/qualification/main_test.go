@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	"istio.io/istio/pkg/test/framework"
-	"istio.io/istio/pkg/test/framework/components/environment"
 	"istio.io/istio/pkg/test/framework/components/istio"
 )
 
@@ -28,7 +27,8 @@ var (
 
 func TestMain(m *testing.M) {
 	framework.
-		NewSuite("qualification", m).
-		SetupOnEnv(environment.Kube, istio.Setup(&ist, nil)).
+		NewSuite(m).
+		RequireSingleCluster().
+		Setup(istio.Setup(&ist, nil)).
 		Run()
 }

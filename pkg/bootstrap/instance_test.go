@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,13 @@
 package bootstrap
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path"
 	"reflect"
@@ -23,22 +28,23 @@ import (
 	"strings"
 	"testing"
 
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+
 	v1 "github.com/census-instrumentation/opencensus-proto/gen-go/trace/v1"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	v2 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v2"
-	tracev2 "github.com/envoyproxy/go-control-plane/envoy/config/trace/v2"
+	trace "github.com/envoyproxy/go-control-plane/envoy/config/trace/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher"
-	"github.com/envoyproxy/go-control-plane/pkg/conversion"
 	"github.com/ghodss/yaml"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/ptypes"
 	diff "gopkg.in/d4l3k/messagediff.v1"
 
 	"istio.io/api/annotation"
 	meshconfig "istio.io/api/mesh/v1alpha1"
 
+	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/bootstrap/platform"
-	"istio.io/istio/pkg/test/env"
 )
 
 type stats struct {
@@ -71,10 +77,8 @@ var (
 // cp $TOP/out/linux_amd64/release/bootstrap/tracing_lightstep/envoy-rev0.json pkg/bootstrap/testdata/tracing_lightstep_golden.json
 // cp $TOP/out/linux_amd64/release/bootstrap/tracing_zipkin/envoy-rev0.json pkg/bootstrap/testdata/tracing_zipkin_golden.json
 func TestGolden(t *testing.T) {
-	out := env.ISTIO_OUT.Value() // defined in the makefile
-	if out == "" {
-		out = "/tmp"
-	}
+	out := "/tmp"
+	var ts *httptest.Server
 
 	cases := []struct {
 		base                       string
@@ -149,25 +153,31 @@ func TestGolden(t *testing.T) {
 		{
 			base: "tracing_stackdriver",
 			setup: func() {
-				credPath := out + "/sd_cred.json"
-				if err := ioutil.WriteFile(credPath, []byte(`{"type": "service_account", "project_id": "my-sd-project"}`), os.ModePerm); err != nil {
-					t.Fatalf("unable write file: %v", err)
+				ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					fmt.Fprintln(w, "my-sd-project")
+				}))
+
+				u, err := url.Parse(ts.URL)
+				if err != nil {
+					t.Fatalf("Unable to parse mock server url: %v", err)
 				}
-				_ = os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credPath)
+				_ = os.Setenv("GCE_METADATA_HOST", u.Host)
 			},
 			teardown: func() {
-				credPath := out + "/sd_cred.json"
-				_ = os.Unsetenv("GOOGLE_APPLICATION_CREDENTIALS")
-				_ = os.Remove(credPath)
+				if ts != nil {
+					ts.Close()
+				}
+				_ = os.Unsetenv("GCE_METADATA_HOST")
 			},
 			check: func(got *v2.Bootstrap, t *testing.T) {
-				cfg := got.Tracing.Http.GetConfig()
-				sdMsg := tracev2.OpenCensusConfig{}
-				if err := conversion.StructToMessage(cfg, &sdMsg); err != nil {
+				// nolint: staticcheck
+				cfg := got.Tracing.Http.GetTypedConfig()
+				sdMsg := trace.OpenCensusConfig{}
+				if err := ptypes.UnmarshalAny(cfg, &sdMsg); err != nil {
 					t.Fatalf("unable to parse: %v %v", cfg, err)
 				}
 
-				want := tracev2.OpenCensusConfig{
+				want := trace.OpenCensusConfig{
 					TraceConfig: &v1.TraceConfig{
 						Sampler: &v1.TraceConfig_ConstantSampler{
 							ConstantSampler: &v1.ConstantSampler{
@@ -182,14 +192,16 @@ func TestGolden(t *testing.T) {
 					StackdriverExporterEnabled: true,
 					StdoutExporterEnabled:      true,
 					StackdriverProjectId:       "my-sd-project",
-					IncomingTraceContext: []tracev2.OpenCensusConfig_TraceContext{
-						tracev2.OpenCensusConfig_CLOUD_TRACE_CONTEXT,
-						tracev2.OpenCensusConfig_TRACE_CONTEXT,
-						tracev2.OpenCensusConfig_GRPC_TRACE_BIN},
-					OutgoingTraceContext: []tracev2.OpenCensusConfig_TraceContext{
-						tracev2.OpenCensusConfig_CLOUD_TRACE_CONTEXT,
-						tracev2.OpenCensusConfig_TRACE_CONTEXT,
-						tracev2.OpenCensusConfig_GRPC_TRACE_BIN},
+					IncomingTraceContext: []trace.OpenCensusConfig_TraceContext{
+						trace.OpenCensusConfig_CLOUD_TRACE_CONTEXT,
+						trace.OpenCensusConfig_TRACE_CONTEXT,
+						trace.OpenCensusConfig_GRPC_TRACE_BIN,
+						trace.OpenCensusConfig_B3},
+					OutgoingTraceContext: []trace.OpenCensusConfig_TraceContext{
+						trace.OpenCensusConfig_CLOUD_TRACE_CONTEXT,
+						trace.OpenCensusConfig_TRACE_CONTEXT,
+						trace.OpenCensusConfig_GRPC_TRACE_BIN,
+						trace.OpenCensusConfig_B3},
 				}
 
 				p, equal := diff.PrettyDiff(sdMsg, want)
@@ -207,6 +219,7 @@ func TestGolden(t *testing.T) {
 			annotations: map[string]string{
 				"sidecar.istio.io/statsInclusionPrefixes": "prefix1,prefix2",
 				"sidecar.istio.io/statsInclusionSuffixes": "suffix1,suffix2",
+				"sidecar.istio.io/extraStatTags":          "dlp_status,dlp_error",
 			},
 			stats: stats{prefixes: "prefix1,prefix2",
 				suffixes: "suffix1,suffix2"},
@@ -215,6 +228,7 @@ func TestGolden(t *testing.T) {
 			base: "stats_inclusion",
 			annotations: map[string]string{
 				"sidecar.istio.io/statsInclusionSuffixes": upstreamStatsSuffixes + "," + downstreamStatsSuffixes,
+				"sidecar.istio.io/extraStatTags":          "dlp_status,dlp_error",
 			},
 			stats: stats{
 				suffixes: upstreamStatsSuffixes + "," + downstreamStatsSuffixes},
@@ -223,6 +237,7 @@ func TestGolden(t *testing.T) {
 			base: "stats_inclusion",
 			annotations: map[string]string{
 				"sidecar.istio.io/statsInclusionPrefixes": "http.{pod_ip}_",
+				"sidecar.istio.io/extraStatTags":          "dlp_status,dlp_error",
 			},
 			// {pod_ip} is unrolled
 			stats: stats{prefixes: "http.10.3.3.3_,http.10.4.4.4_,http.10.5.5.5_,http.10.6.6.6_"},
@@ -231,8 +246,12 @@ func TestGolden(t *testing.T) {
 			base: "stats_inclusion",
 			annotations: map[string]string{
 				"sidecar.istio.io/statsInclusionRegexps": "http.[0-9]*\\.[0-9]*\\.[0-9]*\\.[0-9]*_8080.downstream_rq_time",
+				"sidecar.istio.io/extraStatTags":         "dlp_status,dlp_error",
 			},
 			stats: stats{regexps: "http.[0-9]*\\.[0-9]*\\.[0-9]*\\.[0-9]*_8080.downstream_rq_time"},
+		},
+		{
+			base: "tracing_tls",
 		},
 	}
 
@@ -256,16 +275,15 @@ func TestGolden(t *testing.T) {
 			}
 
 			fn, err := New(Config{
-				Node:           "sidecar~1.2.3.4~foo~bar",
-				DNSRefreshRate: "60s",
-				Proxy:          proxyConfig,
-				PlatEnv:        &fakePlatform{},
+				Node:    "sidecar~1.2.3.4~foo~bar",
+				Proxy:   proxyConfig,
+				PlatEnv: &fakePlatform{},
 				PilotSubjectAltName: []string{
 					"spiffe://cluster.local/ns/istio-system/sa/istio-pilot-service-account"},
-				LocalEnv:     localEnv,
-				NodeIPs:      []string{"10.3.3.3", "10.4.4.4", "10.5.5.5", "10.6.6.6", "10.4.4.4"},
-				SDSUDSPath:   c.sdsUDSPath,
-				SDSTokenPath: c.sdsTokenPath,
+				LocalEnv:          localEnv,
+				NodeIPs:           []string{"10.3.3.3", "10.4.4.4", "10.5.5.5", "10.6.6.6", "10.4.4.4"},
+				OutlierLogPath:    "/dev/stdout",
+				PilotCertProvider: "istiod",
 			}).CreateFileForEpoch(0)
 			if err != nil {
 				t.Fatal(err)
@@ -292,7 +310,10 @@ func TestGolden(t *testing.T) {
 				return
 			}
 
-			golden, err := ioutil.ReadFile("testdata/" + c.base + "_golden.json")
+			goldenFile := "testdata/" + c.base + "_golden.json"
+			util.RefreshGoldenFile(read, goldenFile, t)
+
+			golden, err := ioutil.ReadFile(goldenFile)
 			if err != nil {
 				golden = []byte{}
 			}
@@ -339,7 +360,7 @@ func TestGolden(t *testing.T) {
 			if !reflect.DeepEqual(realM, goldenM) {
 				s, _ := diff.PrettyDiff(goldenM, realM)
 				t.Logf("difference: %s", s)
-				t.Fatalf("\n got: %v\nwant: %v", realM, goldenM)
+				t.Fatalf("\n got: %s\nwant: %s", prettyPrint(jreal), prettyPrint(jgolden))
 			}
 
 			// Check if the LightStep access token file exists
@@ -359,6 +380,12 @@ func TestGolden(t *testing.T) {
 			}
 		})
 	}
+}
+
+func prettyPrint(b []byte) []byte {
+	var out bytes.Buffer
+	_ = json.Indent(&out, b, "", "  ")
+	return out.Bytes()
 }
 
 func checkListStringMatcher(t *testing.T, got *matcher.ListStringMatcher, want string, typ string) {
@@ -405,15 +432,9 @@ func checkStatsMatcher(t *testing.T, got, want *v2.Bootstrap, stats stats) {
 	gsm := got.GetStatsConfig().GetStatsMatcher()
 
 	if stats.prefixes == "" {
-		stats.prefixes = "reporter=," + requiredEnvoyStatsMatcherInclusionPrefixes
+		stats.prefixes = v2Prefixes + requiredEnvoyStatsMatcherInclusionPrefixes + v2Suffix
 	} else {
-		stats.prefixes = "reporter=," + stats.prefixes + "," + requiredEnvoyStatsMatcherInclusionPrefixes
-	}
-
-	if stats.suffixes == "" {
-		stats.suffixes = requiredEnvoyStatsMatcherInclusionSuffix
-	} else {
-		stats.suffixes += "," + requiredEnvoyStatsMatcherInclusionSuffix
+		stats.prefixes = v2Prefixes + stats.prefixes + "," + requiredEnvoyStatsMatcherInclusionPrefixes + v2Suffix
 	}
 
 	if err := gsm.Validate(); err != nil {
@@ -451,6 +472,12 @@ func correctForEnvDifference(in []byte, excludeLocality bool) []byte {
 		{
 			pattern:     regexp.MustCompile(`("access_token_file": ").*(lightstep_access_token.txt")`),
 			replacement: []byte("$1/test-path/$2"),
+		},
+		{
+			// Example: "customConfigFile":"../../tools/packaging/common/envoy_bootstrap.json"
+			// The path may change in CI/other machines
+			pattern:     regexp.MustCompile(`("customConfigFile":").*(envoy_bootstrap.json")`),
+			replacement: []byte(`"customConfigFile":"envoy_bootstrap.json"`),
 		},
 	}
 	if excludeLocality {
@@ -490,7 +517,7 @@ func loadProxyConfig(base, out string, _ *testing.T) (*meshconfig.ProxyConfig, e
 	if gobase == "" {
 		gobase = "../.."
 	}
-	cfg.CustomConfigFile = gobase + "/tools/packaging/common/envoy_bootstrap_v2.json"
+	cfg.CustomConfigFile = gobase + "/tools/packaging/common/envoy_bootstrap.json"
 	return cfg, nil
 }
 
@@ -558,7 +585,7 @@ func TestNodeMetadataEncodeEnvWithIstioMetaPrefix(t *testing.T) {
 		notIstioMetaKey + "=bar",
 		anIstioMetaKey + "=baz",
 	}
-	nm, _, err := getNodeMetaData(envs, nil, nil, false)
+	nm, _, err := getNodeMetaData(envs, nil, nil, 0, &meshconfig.ProxyConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +608,7 @@ func TestNodeMetadata(t *testing.T) {
 		"ISTIO_META_ISTIO_VERSION=1.0.0",
 		`ISTIO_METAJSON_LABELS={"foo":"bar"}`,
 	}
-	nm, _, err := getNodeMetaData(envs, nil, nil, false)
+	nm, _, err := getNodeMetaData(envs, nil, nil, 0, &meshconfig.ProxyConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

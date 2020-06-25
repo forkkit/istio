@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors. All Rights Reserved.
+// Copyright Istio Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,9 @@ import (
 
 	uuid "github.com/satori/go.uuid"
 
+	"istio.io/istio/pkg/test/framework/label"
+
 	"istio.io/istio/pkg/test/framework"
-	"istio.io/istio/pkg/test/framework/components/environment"
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/util/retry"
 	util "istio.io/istio/tests/integration/mixer"
@@ -40,7 +41,7 @@ var (
 // are generated and that they are all a part of the same distributed trace with correct hierarchy and name.
 func TestClientTracing(t *testing.T) {
 	framework.NewTest(t).
-		RequiresEnvironment(environment.Kube).
+		Features("observability.telemetry.tracing.client").
 		Run(func(ctx framework.TestContext) {
 			bookinfoNsInst := tracing.GetBookinfoNamespaceInstance()
 			ingress := tracing.GetIngressInstance()
@@ -66,9 +67,10 @@ func TestClientTracing(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
-	framework.NewSuite("client_tracing_test", m).
-		RequireEnvironment(environment.Kube).
-		SetupOnEnv(environment.Kube, istio.Setup(tracing.GetIstioInstance(), setupConfig)).
+	framework.NewSuite(m).
+		RequireSingleCluster().
+		Label(label.CustomSetup).
+		Setup(istio.Setup(tracing.GetIstioInstance(), setupConfig)).
 		Setup(tracing.TestSetup).
 		Run()
 }
@@ -77,8 +79,7 @@ func setupConfig(cfg *istio.Config) {
 	if cfg == nil {
 		return
 	}
-	cfg.Values["tracing.enabled"] = "true"
 	cfg.Values["tracing.provider"] = "zipkin"
-	cfg.Values["global.enableTracing"] = "true"
-	cfg.Values["global.disablePolicyChecks"] = "true"
+	cfg.Values["meshConfig.enableTracing"] = "true"
+	cfg.Values["meshConfig.disablePolicyChecks"] = "true"
 }

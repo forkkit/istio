@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -60,7 +60,7 @@ func FindBinaryOrFail(t test.Failer) string {
 
 func findBinaries() ([]string, error) {
 	binPaths := make([]string, 0)
-	err := filepath.Walk(env.IstioOut, func(path string, f os.FileInfo, err error) error {
+	err := filepath.Walk(env.LocalOut, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}

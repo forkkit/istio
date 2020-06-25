@@ -18,7 +18,8 @@ spec:
       creationTimestamp: null
       labels:
         app: hello
-        security.istio.io/mtlsReady: "true"
+        istio.io/rev: ""
+        security.istio.io/tlsMode: istio
         tier: backend
         track: stable
     spec:
@@ -36,5 +37,7 @@ spec:
       - image: docker.io/istio/proxy_init:unittest-test
         name: istio-init
         resources: {}
+      securityContext:
+        fsGroup: 1337
 status: {}
 ---

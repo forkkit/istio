@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@ import (
 
 	"fortio.org/fortio/fhttp"
 	"fortio.org/fortio/periodic"
+
+	"istio.io/istio/pkg/test/util/retry"
 
 	"istio.io/istio/pkg/test/framework/components/ingress"
 	"istio.io/istio/pkg/test/framework/components/namespace"
@@ -78,10 +80,13 @@ func VisitProductPage(ing ingress.Instance, timeout time.Duration, wantStatus in
 }
 
 func ValidateMetric(t *testing.T, prometheus prometheus.Instance, query, metricName string, want float64) {
-	got, err := getMetric(t, prometheus, query, metricName)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
+	var got float64
+	retry.UntilSuccessOrFail(t, func() error {
+		var err error
+		got, err = getMetric(t, prometheus, query, metricName)
+		return err
+	}, retry.Delay(time.Second), retry.Timeout(2*time.Minute))
+
 	t.Logf("%s: %f", metricName, got)
 	if got < want {
 		t.Logf("prometheus values for %s:\n%s", metricName, PromDump(prometheus, metricName))

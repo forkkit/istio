@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,19 +19,17 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
-	"regexp"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
 
-	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/components/environment"
-	"istio.io/istio/pkg/test/framework/components/galley"
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/components/pilot"
@@ -64,7 +62,7 @@ spec:
   endpoints:
   {{ if ne .NonExistantService "" }}
   - address: {{.NonExistantService}}
-    locality: {{.NonExistantServiceLocality}}
+    locality: "{{.NonExistantServiceLocality}}"
   {{ end }}
   - address: {{.ServiceBAddress}}
     locality: {{.ServiceBLocality}}
@@ -87,7 +85,9 @@ spec:
       attempts: 3
       perTryTimeout: 1s
       retryOn: gateway-error,connect-failure,refused-stream
----
+`
+
+	failoverYaml = `
 apiVersion: networking.istio.io/v1alpha3
 kind: DestinationRule
 metadata:
@@ -96,8 +96,53 @@ metadata:
 spec:
   host: {{.Host}}
   trafficPolicy:
+    loadBalancer:
+      simple: ROUND_ROBIN
+      localityLbSetting:
+        failover:
+        - from: region
+          to: closeregion
     outlierDetection:
-      consecutiveErrors: 100
+      interval: 1s
+      baseEjectionTime: 3m
+      maxEjectionPercent: 100
+`
+	distributeYaml = `
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: {{.Name}}-destination
+  namespace: {{.Namespace}}
+spec:
+  host: {{.Host}}
+  trafficPolicy:
+    loadBalancer:
+      simple: ROUND_ROBIN
+      localityLbSetting:
+        distribute:
+        - from: region
+          to:
+            notregion: 80
+            region: 20
+    outlierDetection:
+      interval: 1s
+      baseEjectionTime: 3m
+      maxEjectionPercent: 100
+`
+	disabledYaml = `
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: {{.Name}}-destination
+  namespace: {{.Namespace}}
+spec:
+  host: {{.Host}}
+  trafficPolicy:
+    loadBalancer:
+      simple: ROUND_ROBIN
+      localityLbSetting:
+        enabled: false
+    outlierDetection:
       interval: 1s
       baseEjectionTime: 3m
       maxEjectionPercent: 100
@@ -105,12 +150,15 @@ spec:
 )
 
 var (
-	bHostnameMatcher   = regexp.MustCompile("^b-.*$")
 	deploymentTemplate *template.Template
+	failoverTemplate   *template.Template
+	distributeTemplate *template.Template
+	disabledTemplate   *template.Template
+
+	expectAllTrafficToB = map[string]int{"b": sendCount}
 
 	ist istio.Instance
 	p   pilot.Instance
-	g   galley.Instance
 	r   *rand.Rand
 )
 
@@ -120,17 +168,27 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+	failoverTemplate, err = template.New("localityTemplate").Parse(failoverYaml)
+	if err != nil {
+		panic(err)
+	}
+	distributeTemplate, err = template.New("localityTemplate").Parse(distributeYaml)
+	if err != nil {
+		panic(err)
+	}
+	disabledTemplate, err = template.New("localityTemplate").Parse(disabledYaml)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func TestMain(m *testing.M) {
-	framework.NewSuite("locality_prioritized_failover_loadbalancing", m).
+	framework.NewSuite(m).
+		RequireSingleCluster().
 		Label(label.CustomSetup).
-		SetupOnEnv(environment.Kube, istio.Setup(&ist, setupConfig)).
+		Setup(istio.Setup(&ist, nil)).
 		Setup(func(ctx resource.Context) (err error) {
-			if g, err = galley.New(ctx, galley.Config{}); err != nil {
-				return err
-			}
-			if p, err = pilot.New(ctx, pilot.Config{Galley: g}); err != nil {
+			if p, err = pilot.New(ctx, pilot.Config{}); err != nil {
 				return err
 			}
 			r = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -139,29 +197,22 @@ func TestMain(m *testing.M) {
 		Run()
 }
 
-func setupConfig(cfg *istio.Config) {
-	if cfg == nil {
-		return
-	}
-	cfg.Values["pilot.autoscaleEnabled"] = "false"
-	cfg.Values["global.localityLbSetting.failover[0].from"] = "region"
-	cfg.Values["global.localityLbSetting.failover[0].to"] = "closeregion"
-}
-
 func echoConfig(ns namespace.Instance, name string) echo.Config {
 	return echo.Config{
 		Service:   name,
 		Namespace: ns,
 		Locality:  "region.zone.subzone",
+		Subsets:   []echo.SubsetConfig{{}},
 		Ports: []echo.Port{
 			{
 				Name:        "http",
 				Protocol:    protocol.HTTP,
 				ServicePort: 80,
+				// We use a port > 1024 to not require root
+				InstancePort: 8090,
 			},
 		},
-		Galley: g,
-		Pilot:  p,
+		Pilot: p,
 	}
 }
 
@@ -178,13 +229,18 @@ type serviceConfig struct {
 	NonExistantServiceLocality string
 }
 
-func deploy(t test.Failer, ns namespace.Instance, se serviceConfig, from echo.Instance) {
+func deploy(t test.Failer, ctx resource.Context, ns namespace.Instance, se serviceConfig, from echo.Instance, tmpl *template.Template) {
 	t.Helper()
 	var buf bytes.Buffer
 	if err := deploymentTemplate.Execute(&buf, se); err != nil {
 		t.Fatal(err)
 	}
-	g.ApplyConfigOrFail(t, ns, buf.String())
+	ctx.ApplyConfigOrFail(t, ns.Name(), buf.String())
+	buf.Reset()
+	if err := tmpl.Execute(&buf, se); err != nil {
+		t.Fatal(err)
+	}
+	ctx.ApplyConfigOrFail(t, ns.Name(), buf.String())
 
 	err := WaitUntilRoute(from, se.Host)
 	if err != nil {
@@ -223,7 +279,7 @@ func WaitUntilRoute(c echo.Instance, dest string) error {
 	return nil
 }
 
-func sendTraffic(from echo.Instance, host string) error {
+func sendTraffic(from echo.Instance, host string, expected map[string]int) error {
 	headers := http.Header{}
 	headers.Add("Host", host)
 	// This is a hack to remain infrastructure agnostic when running these tests
@@ -240,10 +296,30 @@ func sendTraffic(from echo.Instance, host string) error {
 	if len(resp) != sendCount {
 		return fmt.Errorf("%s->%s expected %d responses, received %d", from.Config().Service, host, sendCount, len(resp))
 	}
-	for i, r := range resp {
-		if match := bHostnameMatcher.FindString(r.Hostname); len(match) == 0 {
-			return fmt.Errorf("%s->%s request[%d] made to unexpected service: %s", from.Config().Service, host, i, r.Hostname)
+	got := map[string]int{}
+	for _, r := range resp {
+		// Hostname will take form of svc-v1-random. We want to extract just 'svc'
+		parts := strings.SplitN(r.Hostname, "-", 2)
+		if len(parts) < 2 {
+			return fmt.Errorf("unexpected hostname: %v", r)
+		}
+		gotHost := parts[0]
+		got[gotHost]++
+	}
+	for svc, reqs := range got {
+		expect := expected[svc]
+		if !almostEquals(reqs, expect, 5) {
+			return fmt.Errorf("unexpected request distribution. Expected: %+v, got: %+v", expected, got)
 		}
 	}
 	return nil
+}
+
+func almostEquals(a, b, precision int) bool {
+	upper := a + precision
+	lower := a - precision
+	if b < lower || b > upper {
+		return false
+	}
+	return true
 }

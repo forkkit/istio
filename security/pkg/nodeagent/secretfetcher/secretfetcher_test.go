@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -155,11 +155,12 @@ sLcSOZBc3XyP5twMeOw2ZOMC0qLupFL2MBEmKerlHo5ehQpW16KBHWn1HxFL8j24
 PAsalRNQlxxWYCEYsf60TIUSqtyt1P5G7S40Rn3CP9SnoX6Q3E0POxEGFe3SStAY
 oCvHkuhGyVKRT4Ddff4gfbvMPlls
 -----END CERTIFICATE-----`)
-	k8sKeyA               = []byte("fake private k8sKeyA")
-	k8sCertChainA         = k8sTestCertChainA
-	k8sCaCertA            = k8sTestCaCertA
-	k8sSecretNameA        = "test-scrtA"
-	k8sTestGenericSecretA = &v1.Secret{
+	k8sTestCaCertExpireTimeB, _ = nodeagentutil.ParseCertAndGetExpiryTimestamp(k8sTestCaCertB)
+	k8sKeyA                     = []byte("fake private k8sKeyA")
+	k8sCertChainA               = k8sTestCertChainA
+	k8sCaCertA                  = k8sTestCaCertA
+	k8sSecretNameA              = "test-scrtA"
+	k8sTestGenericSecretA       = &v1.Secret{
 		Data: map[string][]byte{
 			genericScrtCert:   k8sCertChainA,
 			genericScrtKey:    k8sKeyA,
@@ -267,6 +268,20 @@ oCvHkuhGyVKRT4Ddff4gfbvMPlls
 		},
 		Type: "test-tls-ca-secret",
 	}
+
+	k8sSecretNameG           = "test-scrtG"
+	k8sTestKubernetesSecretG = &v1.Secret{
+		Data: map[string][]byte{
+			tlsScrtCert:   k8sCertChainB,
+			tlsScrtKey:    k8sKeyB,
+			tlsScrtCaCert: k8sCaCertB,
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      k8sSecretNameG,
+			Namespace: "test-namespace",
+		},
+		Type: "test-secret",
+	}
 )
 
 type expectedSecret struct {
@@ -339,10 +354,30 @@ func TestSecretFetcher(t *testing.T) {
 		t.Errorf("added secret should have different version")
 	}
 
+	// Update test secret and verify that key/cert pair is changed and version number is different.
+	expectedUpdateSecrets := []expectedSecret{
+		{
+			exist: true,
+			secret: &model.SecretItem{
+				ResourceName:     k8sSecretNameA,
+				CertificateChain: k8sCertChainB,
+				ExpireTime:       k8sTestCertChainExpireTimeA,
+				PrivateKey:       k8sKeyB,
+			},
+		},
+		{
+			exist: true,
+			secret: &model.SecretItem{
+				ResourceName: k8sSecretNameA + IngressGatewaySdsCaSuffix,
+				RootCert:     k8sCaCertB,
+				ExpireTime:   k8sTestCaCertExpireTimeA,
+			},
+		},
+	}
 	var secretVersionThree string
-	testUpdateSecret(t, gSecretFetcher, k8sTestGenericSecretA, k8sTestGenericSecretB, expectedAddedSecrets, &secretVersionThree)
-	if secretVersionThree != secretVersionTwo {
-		t.Errorf("secret version should remain the same after scrtUpdated is called")
+	testUpdateSecret(t, gSecretFetcher, k8sTestGenericSecretA, k8sTestGenericSecretB, expectedUpdateSecrets, &secretVersionThree)
+	if secretVersionThree == secretVersionTwo || secretVersionThree == secretVersionOne {
+		t.Errorf("updated secret should have different version")
 	}
 
 	// Add test ca only secret and verify that cacert is stored.
@@ -359,10 +394,21 @@ func TestSecretFetcher(t *testing.T) {
 	var secretVersionFour string
 	testAddSecret(t, gSecretFetcher, k8sTestGenericCASecretE, expectedAddedCASecrets, &secretVersionFour)
 
+	// Update test ca only secret and verify that cacert is stored and version number is different.
+	expectedUpdateCASecrets := []expectedSecret{
+		{
+			exist: true,
+			secret: &model.SecretItem{
+				ResourceName: k8sCASecretNameE,
+				RootCert:     k8sCaCertF,
+				ExpireTime:   k8sTestCaCertExpireTimeB,
+			},
+		},
+	}
 	var secretVersionFive string
-	testUpdateSecret(t, gSecretFetcher, k8sTestGenericCASecretE, k8sTestCASecretF, expectedAddedCASecrets, &secretVersionFive)
-	if secretVersionFive != secretVersionFour {
-		t.Errorf("secret version should remain the same after scrtUpdated is called")
+	testUpdateSecret(t, gSecretFetcher, k8sTestGenericCASecretE, k8sTestCASecretF, expectedUpdateCASecrets, &secretVersionFive)
+	if secretVersionFive == secretVersionFour {
+		t.Errorf("updated secret should have different version")
 	}
 
 	// Delete test ca secret and verify that its cacert is removed from local store.
@@ -373,6 +419,42 @@ func TestSecretFetcher(t *testing.T) {
 		},
 	}
 	testDeleteSecret(t, gSecretFetcher, k8sTestGenericCASecretE, expectedDeletedCASecrets)
+
+	// Add test secret and verify that key/cert pair is stored.
+	expectedAddedSecrets = []expectedSecret{
+		{
+			exist: true,
+			secret: &model.SecretItem{
+				ResourceName:     k8sSecretNameG,
+				CertificateChain: k8sCertChainB,
+				ExpireTime:       k8sTestCertChainExpireTimeA,
+				PrivateKey:       k8sKeyB,
+			},
+		},
+		{
+			exist: true,
+			secret: &model.SecretItem{
+				ResourceName: k8sSecretNameG + IngressGatewaySdsCaSuffix,
+				RootCert:     k8sCaCertB,
+				ExpireTime:   k8sTestCaCertExpireTimeA,
+			},
+		},
+	}
+	testAddSecret(t, gSecretFetcher, k8sTestKubernetesSecretG, expectedAddedSecrets, &secretVersionOne)
+
+	// Delete test secret and verify that key/cert pair in secret is removed from local store.
+	expectedDeletedSecrets = []expectedSecret{
+		{
+			exist:  false,
+			secret: &model.SecretItem{ResourceName: k8sSecretNameG},
+		},
+		{
+			exist:  false,
+			secret: &model.SecretItem{ResourceName: k8sSecretNameG + IngressGatewaySdsCaSuffix},
+		},
+	}
+	testDeleteSecret(t, gSecretFetcher, k8sTestKubernetesSecretG, expectedDeletedSecrets)
+
 }
 
 // TestSecretFetcherInvalidSecret verifies that if a secret does not have key or cert, secret fetcher
@@ -604,10 +686,26 @@ func TestSecretFetcherTlsSecretFormat(t *testing.T) {
 	// Add test secret again and verify that key/cert pair is stored and version number is different.
 	testAddSecret(t, gSecretFetcher, k8sTestTLSSecretC, expectedAddedSecrets, &secretVersion)
 
+	// Update test secret and verify that key/cert pair is changed and version number is different.
+	expectedUpdateSecret := []expectedSecret{
+		{
+			exist: true,
+			secret: &model.SecretItem{
+				ResourceName:     k8sSecretNameC,
+				CertificateChain: k8sCertChainD,
+				ExpireTime:       k8sTestCertChainExpireTimeA,
+				PrivateKey:       k8sKeyD,
+			},
+		},
+		{
+			exist:  false,
+			secret: &model.SecretItem{ResourceName: k8sSecretNameC + IngressGatewaySdsCaSuffix},
+		},
+	}
 	var newSecretVersion string
-	testUpdateSecret(t, gSecretFetcher, k8sTestTLSSecretC, k8sTestTLSSecretD, expectedAddedSecrets, &newSecretVersion)
-	if secretVersion != newSecretVersion {
-		t.Errorf("secret version should remain the same after scrtUpdated is called")
+	testUpdateSecret(t, gSecretFetcher, k8sTestTLSSecretC, k8sTestTLSSecretD, expectedUpdateSecret, &newSecretVersion)
+	if secretVersion == newSecretVersion {
+		t.Errorf("updated secret should have different version")
 	}
 }
 
@@ -696,14 +794,35 @@ func TestSecretFetcherUsingFallbackIngressSecret(t *testing.T) {
 		t.Errorf("added secret should have different version")
 	}
 
+	// Update test secret and verify that key/cert pair is changed and version number is different.
+	expectedUpdateSecrets := []expectedSecret{
+		{
+			exist: true,
+			secret: &model.SecretItem{
+				ResourceName:     k8sSecretNameA,
+				CertificateChain: k8sCertChainB,
+				ExpireTime:       k8sTestCertChainExpireTimeA,
+				PrivateKey:       k8sKeyB,
+			},
+		},
+		{
+			exist: true,
+			secret: &model.SecretItem{
+				ResourceName: k8sSecretNameA + IngressGatewaySdsCaSuffix,
+				RootCert:     k8sCaCertB,
+				ExpireTime:   k8sTestCaCertExpireTimeA,
+			},
+		},
+	}
 	var secretVersionThree string
-	testUpdateSecret(t, gSecretFetcher, k8sTestGenericSecretA, k8sTestGenericSecretB, expectedAddedSecrets, &secretVersionThree)
-	if secretVersionThree != secretVersionTwo {
-		t.Errorf("secret version should remain the same after scrtUpdated is called")
+	testUpdateSecret(t, gSecretFetcher, k8sTestGenericSecretA, k8sTestGenericSecretB, expectedUpdateSecrets, &secretVersionThree)
+	if secretVersionThree == secretVersionTwo || secretVersionThree == secretVersionOne {
+		t.Errorf("updated secret should have different version")
 	}
 }
 
 func compareSecret(t *testing.T, secret, expectedSecret *model.SecretItem) {
+	t.Helper()
 	if expectedSecret.ResourceName != secret.ResourceName {
 		t.Errorf("resource name verification error: expected %s but got %s", expectedSecret.ResourceName, secret.ResourceName)
 	}
@@ -719,6 +838,7 @@ func compareSecret(t *testing.T, secret, expectedSecret *model.SecretItem) {
 }
 
 func testAddSecret(t *testing.T, sf *SecretFetcher, k8ssecret *v1.Secret, expectedSecrets []expectedSecret, version *string) {
+	t.Helper()
 	// Add a test secret and find the secret.
 	sf.scrtAdded(k8ssecret)
 	for _, es := range expectedSecrets {

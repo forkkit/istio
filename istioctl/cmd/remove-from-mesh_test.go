@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,16 +19,13 @@ import (
 	"strings"
 	"testing"
 
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-
-	"istio.io/istio/pkg/config/schemas"
-
-	//"istio.io/istio/pilot/pkg/config/kube/crd"
 	appsv1 "k8s.io/api/apps/v1"
 	coreV1 "k8s.io/api/core/v1"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	"istio.io/istio/pkg/config/schema/collections"
 )
 
 var (
@@ -54,11 +51,11 @@ var (
 							Labels: map[string]string{"app": "details"},
 						},
 						Spec: coreV1.PodSpec{
-							Containers: []v1.Container{
+							Containers: []coreV1.Container{
 								{Name: "details", Image: "docker.io/istio/examples-bookinfo-details-v1:1.15.0"},
 								{Name: "istio-proxy", Image: "docker.io/istio/proxyv2:1.2.2"},
 							},
-							InitContainers: []v1.Container{
+							InitContainers: []coreV1.Container{
 								{Name: "istio-init", Image: "docker.io/istio/proxy_init:1.2.2"},
 							},
 						},
@@ -117,8 +114,8 @@ var (
 	cannedDynamicConfig = []runtime.Object{
 		&unstructured.Unstructured{
 			Object: map[string]interface{}{
-				"apiVersion": "networking.istio.io/" + schemas.ServiceEntry.Version,
-				"kind":       schemas.ServiceEntry.VariableName,
+				"apiVersion": "networking.istio.io/" + collections.IstioNetworkingV1Alpha3Serviceentries.Resource().Version(),
+				"kind":       collections.IstioNetworkingV1Alpha3Serviceentries.Resource().Kind(),
 				"metadata": map[string]interface{}{
 					"namespace": "default",
 					"name":      "mesh-expansion-vmtest",
@@ -131,13 +128,19 @@ var (
 func TestRemoveFromMesh(t *testing.T) {
 	cases := []testcase{
 		{
-			description:       "Invalid command args",
+			description:       "Invalid command args - missing service name",
 			args:              strings.Split("experimental remove-from-mesh service", " "),
 			expectedException: true,
 			expectedOutput:    "Error: expecting service name\n",
 		},
 		{
-			description:       "valid case",
+			description:       "Invalid command args - missing deployment name",
+			args:              strings.Split("experimental remove-from-mesh deployment", " "),
+			expectedException: true,
+			expectedOutput:    "Error: expecting deployment name\n",
+		},
+		{
+			description:       "valid case - remove service from mesh",
 			args:              strings.Split("experimental remove-from-mesh service details", " "),
 			expectedException: false,
 			k8sConfigs:        cannedK8sConfig,
@@ -145,11 +148,26 @@ func TestRemoveFromMesh(t *testing.T) {
 			expectedOutput:    "deployment \"details-v1.default\" updated successfully with Istio sidecar un-injected.\n",
 		},
 		{
-			description:       "service not exists",
+			description:       "valid case - remove deployment from mesh",
+			args:              strings.Split("experimental remove-from-mesh deployment details-v1", " "),
+			expectedException: false,
+			k8sConfigs:        cannedK8sConfig,
+			namespace:         "default",
+			expectedOutput:    "deployment \"details-v1.default\" updated successfully with Istio sidecar un-injected.\n",
+		},
+		{
+			description:       "service does not exist",
 			args:              strings.Split("experimental remove-from-mesh service test", " "),
 			expectedException: true,
 			k8sConfigs:        cannedK8sConfig,
 			expectedOutput:    "Error: service \"test\" does not exist, skip\n",
+		},
+		{
+			description:       "deployment does not exist",
+			args:              strings.Split("experimental remove-from-mesh deployment test", " "),
+			expectedException: true,
+			k8sConfigs:        cannedK8sConfig,
+			expectedOutput:    "Error: deployment \"test\" does not exist\n",
 		},
 		{
 			description:       "service without deployment",
@@ -166,7 +184,7 @@ func TestRemoveFromMesh(t *testing.T) {
 			expectedOutput:    "Error: expecting external service name\n",
 		},
 		{
-			description:       "service does not exist",
+			description:       "external-service does not exist",
 			args:              strings.Split("experimental remove-from-mesh external-service test", " "),
 			expectedException: true,
 			k8sConfigs:        cannedK8sConfig,

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,27 +24,22 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"go.uber.org/atomic"
 
-	authn "istio.io/api/authentication/v1alpha1"
 	mpb "istio.io/api/mixer/v1"
 	mccpb "istio.io/api/mixer/v1/config/client"
 	networking "istio.io/api/networking/v1alpha3"
-	rbac "istio.io/api/rbac/v1alpha1"
 	authz "istio.io/api/security/v1beta1"
 	api "istio.io/api/type/v1beta1"
 	"istio.io/pkg/log"
 
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/constants"
-	"istio.io/istio/pkg/config/schema"
-	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/resource"
 	pkgtest "istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/config"
 )
 
 var (
-	// Types defines the mock config descriptor
-	Types = schema.Set{schemas.MockConfig}
-
 	// ExampleVirtualService is an example V2 route rule
 	ExampleVirtualService = &networking.VirtualService{
 		Hosts: []string{"prod", "test"},
@@ -166,50 +161,6 @@ var (
 		},
 	}
 
-	// ExampleAuthenticationPolicy is an example authentication Policy
-	ExampleAuthenticationPolicy = &authn.Policy{
-		Targets: []*authn.TargetSelector{{
-			Name: "hello",
-		}},
-		Peers: []*authn.PeerAuthenticationMethod{{
-			Params: &authn.PeerAuthenticationMethod_Mtls{},
-		}},
-	}
-
-	// ExampleServiceRole is an example rbac service role
-	ExampleServiceRole = &rbac.ServiceRole{Rules: []*rbac.AccessRule{
-		{
-			Services: []string{"service0"},
-			Methods:  []string{"GET", "POST"},
-			Constraints: []*rbac.AccessRule_Constraint{
-				{Key: "key", Values: []string{"value"}},
-				{Key: "key", Values: []string{"value"}},
-			},
-		},
-		{
-			Services: []string{"service0"},
-			Methods:  []string{"GET", "POST"},
-			Constraints: []*rbac.AccessRule_Constraint{
-				{Key: "key", Values: []string{"value"}},
-				{Key: "key", Values: []string{"value"}},
-			},
-		},
-	}}
-
-	// ExampleServiceRoleBinding is an example rbac service role binding
-	ExampleServiceRoleBinding = &rbac.ServiceRoleBinding{
-		Subjects: []*rbac.Subject{
-			{User: "User0", Group: "Group0", Properties: map[string]string{"prop0": "value0"}},
-			{User: "User1", Group: "Group1", Properties: map[string]string{"prop1": "value1"}},
-		},
-		RoleRef: &rbac.RoleRef{Kind: "ServiceRole", Name: "ServiceRole001"},
-	}
-
-	// ExampleRbacConfig is an example rbac config
-	ExampleRbacConfig = &rbac.RbacConfig{
-		Mode: rbac.RbacConfig_ON,
-	}
-
 	// ExampleAuthorizationPolicy is an example AuthorizationPolicy
 	ExampleAuthorizationPolicy = &authz.AuthorizationPolicy{
 		Selector: &api.WorkloadSelector{
@@ -219,6 +170,8 @@ var (
 			},
 		},
 	}
+
+	mockGvk = collections.Mock.Resource().GroupVersionKind()
 )
 
 // Make creates a mock config indexed by a number
@@ -226,11 +179,9 @@ func Make(namespace string, i int) model.Config {
 	name := fmt.Sprintf("%s%d", "mock-config", i)
 	return model.Config{
 		ConfigMeta: model.ConfigMeta{
-			Type:      schemas.MockConfig.Type,
-			Group:     "test.istio.io",
-			Version:   "v1",
-			Name:      name,
-			Namespace: namespace,
+			GroupVersionKind: mockGvk,
+			Name:             name,
+			Namespace:        namespace,
 			Labels: map[string]string{
 				"key": name,
 			},
@@ -259,7 +210,7 @@ func Compare(a, b model.Config) bool {
 // CheckMapInvariant validates operational invariants of an empty config registry
 func CheckMapInvariant(r model.ConfigStore, t *testing.T, namespace string, n int) {
 	// check that the config descriptor is the mock config descriptor
-	_, contains := r.ConfigDescriptor().GetByType(schemas.MockConfig.Type)
+	_, contains := r.Schemas().FindByGroupVersionKind(mockGvk)
 	if !contains {
 		t.Error("expected config mock types")
 	}
@@ -284,7 +235,7 @@ func CheckMapInvariant(r model.ConfigStore, t *testing.T, namespace string, n in
 
 	// check that elements are stored
 	for i, elt := range elts {
-		v1 := r.Get(schemas.MockConfig.Type, elt.Name, elt.Namespace)
+		v1 := r.Get(mockGvk, elt.Name, elt.Namespace)
 		if v1 == nil || !Compare(elt, *v1) {
 			t.Errorf("wanted %v, got %v", elt, v1)
 		} else {
@@ -300,18 +251,18 @@ func CheckMapInvariant(r model.ConfigStore, t *testing.T, namespace string, n in
 
 	invalid := model.Config{
 		ConfigMeta: model.ConfigMeta{
-			Type:            schemas.MockConfig.Type,
-			Name:            "invalid",
-			ResourceVersion: revs[0],
+			GroupVersionKind: mockGvk,
+			Name:             "invalid",
+			ResourceVersion:  revs[0],
 		},
 		Spec: &config.MockConfig{},
 	}
 
 	missing := model.Config{
 		ConfigMeta: model.ConfigMeta{
-			Type:            schemas.MockConfig.Type,
-			Name:            "missing",
-			ResourceVersion: revs[0],
+			GroupVersionKind: mockGvk,
+			Name:             "missing",
+			ResourceVersion:  revs[0],
 		},
 		Spec: &config.MockConfig{Key: "missing"},
 	}
@@ -336,47 +287,36 @@ func CheckMapInvariant(r model.ConfigStore, t *testing.T, namespace string, n in
 		t.Error("expected error putting missing object with a missing key")
 	}
 
-	if _, err := r.Update(elts[0]); err == nil {
-		t.Error("expected error putting object without revision")
-	}
-
-	badrevision := elts[0]
-	badrevision.ResourceVersion = "bad"
-
-	if _, err := r.Update(badrevision); err == nil {
-		t.Error("expected error putting object with a bad revision")
-	}
-
 	// check for missing type
-	if l, _ := r.List("missing", namespace); len(l) > 0 {
+	if l, _ := r.List(resource.GroupVersionKind{}, namespace); len(l) > 0 {
 		t.Errorf("unexpected objects for missing type")
 	}
 
 	// check for missing element
-	if cfg := r.Get(schemas.MockConfig.Type, "missing", ""); cfg != nil {
+	if cfg := r.Get(mockGvk, "missing", ""); cfg != nil {
 		t.Error("unexpected configuration object found")
 	}
 
 	// check for missing element
-	if cfg := r.Get("missing", "missing", ""); cfg != nil {
+	if cfg := r.Get(resource.GroupVersionKind{}, "missing", ""); cfg != nil {
 		t.Error("unexpected configuration object found")
 	}
 
 	// delete missing elements
-	if err := r.Delete("missing", "missing", ""); err == nil {
+	if err := r.Delete(resource.GroupVersionKind{}, "missing", ""); err == nil {
 		t.Error("expected error on deletion of missing type")
 	}
 
 	// delete missing elements
-	if err := r.Delete(schemas.MockConfig.Type, "missing", ""); err == nil {
+	if err := r.Delete(mockGvk, "missing", ""); err == nil {
 		t.Error("expected error on deletion of missing element")
 	}
-	if err := r.Delete(schemas.MockConfig.Type, "missing", "unknown"); err == nil {
+	if err := r.Delete(mockGvk, "missing", "unknown"); err == nil {
 		t.Error("expected error on deletion of missing element in unknown namespace")
 	}
 
 	// list elements
-	l, err := r.List(schemas.MockConfig.Type, namespace)
+	l, err := r.List(mockGvk, namespace)
 	if err != nil {
 		t.Errorf("List error %#v, %v", l, err)
 	}
@@ -397,7 +337,7 @@ func CheckMapInvariant(r model.ConfigStore, t *testing.T, namespace string, n in
 
 	// check that elements are stored
 	for i, elt := range elts {
-		v1 := r.Get(schemas.MockConfig.Type, elts[i].Name, elts[i].Namespace)
+		v1 := r.Get(mockGvk, elts[i].Name, elts[i].Namespace)
 		if v1 == nil || !Compare(elt, *v1) {
 			t.Errorf("wanted %v, got %v", elt, v1)
 		}
@@ -405,13 +345,13 @@ func CheckMapInvariant(r model.ConfigStore, t *testing.T, namespace string, n in
 
 	// delete all elements
 	for i := range elts {
-		if err = r.Delete(schemas.MockConfig.Type, elts[i].Name, elts[i].Namespace); err != nil {
+		if err = r.Delete(mockGvk, elts[i].Name, elts[i].Namespace); err != nil {
 			t.Error(err)
 		}
 	}
 	log.Info("Delete elements")
 
-	l, err = r.List(schemas.MockConfig.Type, namespace)
+	l, err = r.List(mockGvk, namespace)
 	if err != nil {
 		t.Error(err)
 	}
@@ -432,33 +372,26 @@ func CheckIstioConfigTypes(store model.ConfigStore, namespace string, t *testing
 	cases := []struct {
 		name       string
 		configName string
-		schema     schema.Instance
+		schema     collection.Schema
 		spec       proto.Message
 	}{
-		{"VirtualService", configName, schemas.VirtualService, ExampleVirtualService},
-		{"DestinationRule", configName, schemas.DestinationRule, ExampleDestinationRule},
-		{"ServiceEntry", configName, schemas.ServiceEntry, ExampleServiceEntry},
-		{"Gateway", configName, schemas.Gateway, ExampleGateway},
-		{"HTTPAPISpec", configName, schemas.HTTPAPISpec, ExampleHTTPAPISpec},
-		{"HTTPAPISpecBinding", configName, schemas.HTTPAPISpecBinding, ExampleHTTPAPISpecBinding},
-		{"QuotaSpec", configName, schemas.QuotaSpec, ExampleQuotaSpec},
-		{"QuotaSpecBinding", configName, schemas.QuotaSpecBinding, ExampleQuotaSpecBinding},
-		{"Policy", configName, schemas.AuthenticationPolicy, ExampleAuthenticationPolicy},
-		{"ServiceRole", configName, schemas.ServiceRole, ExampleServiceRole},
-		{"ServiceRoleBinding", configName, schemas.ServiceRoleBinding, ExampleServiceRoleBinding},
-		{"RbacConfig", constants.DefaultRbacConfigName, schemas.RbacConfig, ExampleRbacConfig},
-		{"ClusterRbacConfig", constants.DefaultRbacConfigName, schemas.ClusterRbacConfig, ExampleRbacConfig},
-		{"AuthorizationPolicy", configName, schemas.AuthorizationPolicy, ExampleAuthorizationPolicy},
+		{"VirtualService", configName, collections.IstioNetworkingV1Alpha3Virtualservices, ExampleVirtualService},
+		{"DestinationRule", configName, collections.IstioNetworkingV1Alpha3Destinationrules, ExampleDestinationRule},
+		{"ServiceEntry", configName, collections.IstioNetworkingV1Alpha3Serviceentries, ExampleServiceEntry},
+		{"Gateway", configName, collections.IstioNetworkingV1Alpha3Gateways, ExampleGateway},
+		{"HTTPAPISpec", configName, collections.IstioConfigV1Alpha2Httpapispecs, ExampleHTTPAPISpec},
+		{"HTTPAPISpecBinding", configName, collections.IstioConfigV1Alpha2Httpapispecbindings, ExampleHTTPAPISpecBinding},
+		{"QuotaSpec", configName, collections.IstioMixerV1ConfigClientQuotaspecs, ExampleQuotaSpec},
+		{"QuotaSpecBinding", configName, collections.IstioMixerV1ConfigClientQuotaspecbindings, ExampleQuotaSpecBinding},
+		{"AuthorizationPolicy", configName, collections.IstioSecurityV1Beta1Authorizationpolicies, ExampleAuthorizationPolicy},
 	}
 
 	for _, c := range cases {
 		configMeta := model.ConfigMeta{
-			Type:    c.schema.Type,
-			Name:    c.configName,
-			Group:   c.schema.Group + constants.IstioAPIGroupDomain,
-			Version: c.schema.Version,
+			GroupVersionKind: c.schema.Resource().GroupVersionKind(),
+			Name:             c.configName,
 		}
-		if !c.schema.ClusterScoped {
+		if !c.schema.Resource().IsClusterScoped() {
 			configMeta.Namespace = namespace
 		}
 
@@ -477,7 +410,7 @@ func CheckCacheEvents(store model.ConfigStore, cache model.ConfigStoreCache, nam
 	stop := make(chan struct{})
 	defer close(stop)
 	added, deleted := atomic.NewInt64(0), atomic.NewInt64(0)
-	cache.RegisterEventHandler(schemas.MockConfig.Type, func(_ model.Config, ev model.Event) {
+	cache.RegisterEventHandler(mockGvk, func(_, _ model.Config, ev model.Event) {
 		switch ev {
 		case model.EventAdd:
 			if deleted.Load() != 0 {
@@ -510,9 +443,9 @@ func CheckCacheFreshness(cache model.ConfigStoreCache, namespace string, t *test
 	o := Make(namespace, 0)
 
 	// validate cache consistency
-	cache.RegisterEventHandler(schemas.MockConfig.Type, func(config model.Config, ev model.Event) {
-		elts, _ := cache.List(schemas.MockConfig.Type, namespace)
-		elt := cache.Get(o.Type, o.Name, o.Namespace)
+	cache.RegisterEventHandler(mockGvk, func(_, config model.Config, ev model.Event) {
+		elts, _ := cache.List(mockGvk, namespace)
+		elt := cache.Get(o.GroupVersionKind, o.Name, o.Namespace)
 		switch ev {
 		case model.EventAdd:
 			if len(elts) != 1 {
@@ -537,7 +470,7 @@ func CheckCacheFreshness(cache model.ConfigStoreCache, namespace string, t *test
 			}
 
 			log.Infof("Calling Delete(%s)", config.Key())
-			if err := cache.Delete(schemas.MockConfig.Type, config.Name, config.Namespace); err != nil {
+			if err := cache.Delete(mockGvk, config.Name, config.Namespace); err != nil {
 				t.Error(err)
 			}
 		case model.EventDelete:
@@ -553,7 +486,7 @@ func CheckCacheFreshness(cache model.ConfigStoreCache, namespace string, t *test
 	go cache.Run(stop)
 
 	// try warm-up with empty Get
-	if cfg := cache.Get("unknown", "example", namespace); cfg != nil {
+	if cfg := cache.Get(resource.GroupVersionKind{}, "example", namespace); cfg != nil {
 		t.Error("unexpected result for unknown type")
 	}
 
@@ -589,21 +522,21 @@ func CheckCacheSync(store model.ConfigStore, cache model.ConfigStoreCache, names
 	defer close(stop)
 	go cache.Run(stop)
 	pkgtest.Eventually(t, "HasSynced", cache.HasSynced)
-	os, _ := cache.List(schemas.MockConfig.Type, namespace)
+	os, _ := cache.List(mockGvk, namespace)
 	if len(os) != n {
 		t.Errorf("cache.List => Got %d, expected %d", len(os), n)
 	}
 
 	// remove elements directly through client
 	for i := 0; i < n; i++ {
-		if err := store.Delete(schemas.MockConfig.Type, keys[i].Name, keys[i].Namespace); err != nil {
+		if err := store.Delete(mockGvk, keys[i].Name, keys[i].Namespace); err != nil {
 			t.Error(err)
 		}
 	}
 
 	// check again in the controller cache
 	pkgtest.Eventually(t, "no elements in cache", func() bool {
-		os, _ = cache.List(schemas.MockConfig.Type, namespace)
+		os, _ = cache.List(mockGvk, namespace)
 		log.Infof("cache.List => Got %d, expected %d", len(os), 0)
 		return len(os) == 0
 	})
@@ -617,8 +550,8 @@ func CheckCacheSync(store model.ConfigStore, cache model.ConfigStoreCache, names
 
 	// check directly through the client
 	pkgtest.Eventually(t, "cache and backing store match", func() bool {
-		cs, _ := cache.List(schemas.MockConfig.Type, namespace)
-		os, _ := store.List(schemas.MockConfig.Type, namespace)
+		cs, _ := cache.List(mockGvk, namespace)
+		os, _ := store.List(mockGvk, namespace)
 		log.Infof("cache.List => Got %d, expected %d", len(cs), n)
 		log.Infof("store.List => Got %d, expected %d", len(os), n)
 		return len(os) == n && len(cs) == n
@@ -626,7 +559,7 @@ func CheckCacheSync(store model.ConfigStore, cache model.ConfigStoreCache, names
 
 	// remove elements directly through the client
 	for i := 0; i < n; i++ {
-		if err := store.Delete(schemas.MockConfig.Type, keys[i].Name, keys[i].Namespace); err != nil {
+		if err := store.Delete(mockGvk, keys[i].Name, keys[i].Namespace); err != nil {
 			t.Error(err)
 		}
 	}

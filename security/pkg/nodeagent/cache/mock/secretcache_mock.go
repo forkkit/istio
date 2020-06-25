@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,65 +16,118 @@ package mock
 
 import (
 	"context"
+	"encoding/pem"
 	"fmt"
+	"path"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"math/rand"
-	"sync/atomic"
-	"time"
+	"istio.io/istio/security/pkg/pki/util"
 )
 
+var (
+	sampleKeyCertsPath = "../../../../samples/certs/"
+	caCertPath         = path.Join(sampleKeyCertsPath, "ca-cert.pem")
+	caKeyPath          = path.Join(sampleKeyCertsPath, "ca-key.pem")
+	certChainPath      = path.Join(sampleKeyCertsPath, "cert-chain.pem")
+	rootCertPath       = path.Join(sampleKeyCertsPath, "root-cert.pem")
+)
+
+// CAClient is the mocked CAClient for testing.
 type CAClient struct {
-	signInvokeCount     uint64
-	mockCertChain1st    []string
-	mockCertChainRemain []string
+	SignInvokeCount uint64
+	errorCount      uint64
+	errorCountMutex *sync.Mutex
+	errors          uint64
+	bundle          util.KeyCertBundle
+	certLifetime    time.Duration
+	GeneratedCerts  [][]string // Cache the generated certificates for verification purpose.
 }
 
-func NewMockCAClient(mockCertChain1st, mockCertChainRemain []string) *CAClient {
+// NewMockCAClient creates an instance of CAClient. errors is used to specify the number of errors
+// before CSRSign returns a valid response. certLifetime specifies the TTL for the newly issued workload cert.
+func NewMockCAClient(errors uint64, certLifetime time.Duration) (*CAClient, error) {
 	cl := CAClient{
-		mockCertChain1st:    mockCertChain1st,
-		mockCertChainRemain: mockCertChainRemain,
+		SignInvokeCount: 0,
+		errorCount:      0,
+		errorCountMutex: &sync.Mutex{},
+		errors:          errors,
+		certLifetime:    certLifetime,
 	}
-	atomic.StoreUint64(&cl.signInvokeCount, 0)
-	return &cl
+	bundle, err := util.NewVerifiedKeyCertBundleFromFile(caCertPath, caKeyPath, certChainPath, rootCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("mock ca client creation error: %v", err)
+	}
+	cl.bundle = bundle
+
+	atomic.StoreUint64(&cl.SignInvokeCount, 0)
+	return &cl, nil
 }
 
-func (c *CAClient) CSRSign(ctx context.Context, csrPEM []byte, exchangedToken string,
+// CSRSign returns the certificate or errors depending on the settings.
+func (c *CAClient) CSRSign(ctx context.Context, reqID string, csrPEM []byte, exchangedToken string,
 	certValidTTLInSec int64) ([]string /*PEM-encoded certificate chain*/, error) {
-	// Mock CSRSign failure errors to force Citadel agent to retry.
-	// 50% chance of failure.
-	if rand.Intn(2) != 0 {
+	c.errorCountMutex.Lock()
+	if c.errorCount < c.errors {
+		c.errorCount++
+		c.errorCountMutex.Unlock()
 		return nil, status.Error(codes.Unavailable, "CA is unavailable")
 	}
+	c.errorCountMutex.Unlock()
 
-	if atomic.LoadUint64(&c.signInvokeCount) == 0 {
-		atomic.AddUint64(&c.signInvokeCount, 1)
-		return nil, status.Error(codes.Internal, "some internal error")
+	atomic.AddUint64(&c.SignInvokeCount, 1)
+	signingCert, signingKey, certChain, rootCert := c.bundle.GetAll()
+	csr, err := util.ParsePemEncodedCSR(csrPEM)
+	if err != nil {
+		return nil, fmt.Errorf("csr sign error: %v", err)
+	}
+	subjectIDs := []string{"test"}
+	certBytes, err := util.GenCertFromCSR(csr, signingCert, csr.PublicKey, *signingKey, subjectIDs, c.certLifetime, false)
+	if err != nil {
+		return nil, fmt.Errorf("csr sign error: %v", err)
 	}
 
-	if atomic.LoadUint64(&c.signInvokeCount) == 1 {
-		atomic.AddUint64(&c.signInvokeCount, 1)
-		return c.mockCertChain1st, nil
+	block := &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certBytes,
 	}
+	cert := pem.EncodeToMemory(block)
 
-	return c.mockCertChainRemain, nil
+	ret := []string{string(cert), string(certChain), string(rootCert)}
+	c.GeneratedCerts = append(c.GeneratedCerts, ret)
+	return ret, nil
 }
 
+// TokenExchangeServer is the mocked token exchange server for testing.
 type TokenExchangeServer struct {
+	errorCount      uint64
+	errorCountMutex *sync.Mutex
+	errors          uint64
 }
 
-func NewMockTokenExchangeServer() *TokenExchangeServer {
-	return &TokenExchangeServer{}
+// NewMockTokenExchangeServer creates an instance of TokenExchangeServer. errors is used to
+// specify the number of errors before ExchangeToken returns a dumb token.
+func NewMockTokenExchangeServer(errors uint64) *TokenExchangeServer {
+	return &TokenExchangeServer{
+		errorCount:      0,
+		errorCountMutex: &sync.Mutex{},
+		errors:          errors,
+	}
 }
 
+// ExchangeToken returns a dumb token or errors depending on the settings.
 func (s *TokenExchangeServer) ExchangeToken(context.Context, string, string) (string, time.Time, int, error) {
-	// Mock ExchangeToken failure errors to force Citadel agent to retry.
-	// 50% chance of failure.
-	if rand.Intn(2) != 0 {
+	s.errorCountMutex.Lock()
+	if s.errorCount < s.errors {
+		s.errorCount++
+		s.errorCountMutex.Unlock()
 		return "", time.Time{}, 503, fmt.Errorf("service unavailable")
 	}
+	s.errorCountMutex.Unlock()
 	// Since the secret cache uses the k8s token in the stored secret, we can just return anything here.
 	return "some-token", time.Now(), 200, nil
 }

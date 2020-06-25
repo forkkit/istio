@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,15 @@ package locality
 import (
 	"fmt"
 	"testing"
+	"time"
+
+	"istio.io/pkg/log"
 
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/echoboot"
-	"istio.io/istio/pkg/test/framework/components/environment"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/util/retry"
-	"istio.io/pkg/log"
 )
 
 // This test allows for Locality Load Balancing Failover testing without needing Kube nodes in multiple regions.
@@ -74,7 +75,6 @@ func TestFailover(t *testing.T) {
 		RunParallel(func(ctx framework.TestContext) {
 
 			ctx.NewSubTest("CDS").
-				RequiresEnvironment(environment.Kube).
 				RunParallel(func(ctx framework.TestContext) {
 					ns := namespace.NewOrFail(ctx, ctx, namespace.Config{
 						Prefix: "locality-failover-cds",
@@ -90,7 +90,7 @@ func TestFailover(t *testing.T) {
 
 					fakeHostname := fmt.Sprintf("fake-cds-external-service-%v.com", r.Int())
 
-					deploy(ctx, ns, serviceConfig{
+					deploy(ctx, ctx, ns, serviceConfig{
 						Name:                       "failover-cds",
 						Host:                       fakeHostname,
 						Namespace:                  ns.Name(),
@@ -101,19 +101,18 @@ func TestFailover(t *testing.T) {
 						ServiceCLocality:           "notcloseregion/zone/subzone",
 						NonExistantService:         "nonexistantservice",
 						NonExistantServiceLocality: "region/zone/subzone",
-					}, a)
+					}, a, failoverTemplate)
 
 					// Send traffic to service B via a service entry.
 					log.Infof("Sending traffic to local service (CDS) via %v", fakeHostname)
 					if err := retry.UntilSuccess(func() error {
-						return sendTraffic(a, fakeHostname)
-					}); err != nil {
+						return sendTraffic(a, fakeHostname, expectAllTrafficToB)
+					}, retry.Delay(time.Second*5)); err != nil {
 						ctx.Fatal(err)
 					}
 				})
 
 			ctx.NewSubTest("EDS").
-				RequiresEnvironment(environment.Kube).
 				RunParallel(func(ctx framework.TestContext) {
 					ns := namespace.NewOrFail(ctx, ctx, namespace.Config{
 						Prefix: "locality-failover-eds",
@@ -128,24 +127,24 @@ func TestFailover(t *testing.T) {
 						BuildOrFail(ctx)
 
 					fakeHostname := fmt.Sprintf("fake-eds-external-service-%v.com", r.Int())
-					deploy(ctx, ns, serviceConfig{
+					deploy(ctx, ctx, ns, serviceConfig{
 						Name:                       "failover-eds",
 						Host:                       fakeHostname,
 						Namespace:                  ns.Name(),
 						Resolution:                 "STATIC",
-						ServiceBAddress:            b.WorkloadsOrFail(ctx)[0].Address(),
+						ServiceBAddress:            b.Address(),
 						ServiceBLocality:           "closeregion/zone/subzone",
-						ServiceCAddress:            c.WorkloadsOrFail(ctx)[0].Address(),
+						ServiceCAddress:            c.Address(),
 						ServiceCLocality:           "notcloseregion/zone/subzone",
 						NonExistantService:         "10.10.10.10",
 						NonExistantServiceLocality: "region/zone/subzone",
-					}, a)
+					}, a, failoverTemplate)
 
 					// Send traffic to service B via a service entry.
 					log.Infof("Sending traffic to local service (EDS) via %v", fakeHostname)
 					if err := retry.UntilSuccess(func() error {
-						return sendTraffic(a, fakeHostname)
-					}); err != nil {
+						return sendTraffic(a, fakeHostname, expectAllTrafficToB)
+					}, retry.Delay(time.Second*5)); err != nil {
 						ctx.Fatal(err)
 					}
 				})

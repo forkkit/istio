@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,15 @@ package framework
 
 import (
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"istio.io/istio/pkg/test/framework/components/environment"
+	"istio.io/pkg/log"
+
+	"istio.io/istio/pkg/test/env"
+	"istio.io/istio/pkg/test/framework/features"
 	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/scopes"
 )
@@ -27,12 +32,16 @@ import (
 // Test allows the test author to specify test-related metadata in a fluent-style, before commencing execution.
 type Test struct {
 	// name to be used when creating a Golang test. Only used for subtests.
-	name        string
-	parent      *Test
-	goTest      *testing.T
-	labels      []label.Instance
-	s           *suiteContext
-	requiredEnv environment.Name
+	name   string
+	parent *Test
+	goTest *testing.T
+	labels []label.Instance
+	// featureLabels maps features to the scenarios they cover.
+	featureLabels       map[features.Feature][]string
+	notImplemented      bool
+	s                   *suiteContext
+	requiredMinClusters int
+	requiredMaxClusters int
 
 	ctx *testContext
 
@@ -44,6 +53,9 @@ type Test struct {
 	hasParallelChildren bool
 }
 
+// globalCleanupLock defines a global wait group to synchronize cleanup of test suites
+var globalParentLock = new(sync.Map)
+
 // NewTest returns a new test wrapper for running a single test.
 func NewTest(t *testing.T) *Test {
 	rtMu.Lock()
@@ -54,8 +66,9 @@ func NewTest(t *testing.T) *Test {
 	}
 
 	runner := &Test{
-		s:      rt.suiteContext(),
-		goTest: t,
+		s:             rt.suiteContext(),
+		goTest:        t,
+		featureLabels: make(map[features.Feature][]string),
 	}
 
 	return runner
@@ -67,11 +80,53 @@ func (t *Test) Label(labels ...label.Instance) *Test {
 	return t
 }
 
-// RequiresEnvironment ensures that the current environment matches what the suite expects. Otherwise it stops test
-// execution and skips the test.
-func (t *Test) RequiresEnvironment(name environment.Name) *Test {
-	t.requiredEnv = name
+// Label applies the given labels to this test.
+func (t *Test) Features(feats ...features.Feature) *Test {
+	c, err := features.BuildChecker(env.IstioSrc + "/pkg/test/framework/features/features.yaml")
+	if err != nil {
+		log.Errorf("Unable to build feature checker: %s", err)
+		t.goTest.FailNow()
+		return nil
+	}
+	for _, f := range feats {
+		check, scenario := c.Check(f)
+		if !check {
+			log.Errorf("feature %s is not present in /pkg/test/framework/features/features.yaml", f)
+			t.goTest.FailNow()
+			return nil
+		}
+		// feats actually contains feature and scenario.  split them here.
+		onlyFeature := features.Feature(strings.Replace(string(f), scenario, "", 1))
+		t.featureLabels[onlyFeature] = append(t.featureLabels[onlyFeature], scenario)
+	}
+
 	return t
+}
+
+func (t *Test) NotImplementedYet(features ...features.Feature) *Test {
+	t.notImplemented = true
+	t.Features(features...).
+		Run(func(_ TestContext) { t.goTest.Skip("Test Not Yet Implemented") })
+	return t
+}
+
+// RequiresMinClusters ensures that the current environment contains at least the expected number of clusters.
+// Otherwise it stops test execution and skips the test.
+func (t *Test) RequiresMinClusters(minClusters int) *Test {
+	t.requiredMinClusters = minClusters
+	return t
+}
+
+// RequiresMaxClusters ensures that the current environment contains at most the expected number of clusters.
+// Otherwise it stops test execution and skips the test.
+func (t *Test) RequiresMaxClusters(maxClusters int) *Test {
+	t.requiredMaxClusters = maxClusters
+	return t
+}
+
+// RequiresSingleCluster this a utility that requires the min/max clusters to both = 1.
+func (t *Test) RequiresSingleCluster(maxClusters int) *Test {
+	return t.RequiresMaxClusters(1).RequiresMinClusters(1)
 }
 
 // Run the test, supplied as a lambda.
@@ -139,6 +194,24 @@ func (t *Test) runInternal(fn func(ctx TestContext), parallel bool) {
 		panic(fmt.Sprintf("Attempting to run test `%s` more than once", testName))
 	}
 
+	if t.s.skipped {
+		t.goTest.Skip("Skipped because parent Suite was skipped.")
+		return
+	}
+
+	// TODO: should we also block new cases?
+	var myGoTest *testing.T
+	if t.goTest != nil {
+		myGoTest = t.goTest
+	} else {
+		myGoTest = t.parent.goTest
+	}
+	suiteName := t.s.settings.TestID
+	if len(t.featureLabels) < 1 && !features.GlobalWhitelist.Contains(suiteName, myGoTest.Name()) {
+		myGoTest.Fatalf("Detected new test %s in suite %s with no feature labels.  "+
+			"See istio/istio/pkg/test/framework/features/README.md", myGoTest.Name(), suiteName)
+	}
+
 	if t.parent != nil {
 		// Create a new subtest under the parent's test.
 		parentGoTest := t.parent.goTest
@@ -154,6 +227,30 @@ func (t *Test) runInternal(fn func(ctx TestContext), parallel bool) {
 }
 
 func (t *Test) doRun(ctx *testContext, fn func(ctx TestContext), parallel bool) {
+	if fn == nil {
+		panic("attempting to run test with nil function")
+	}
+
+	t.ctx = ctx
+
+	if t.requiredMinClusters > 0 && len(t.s.Environment().Clusters()) < t.requiredMinClusters {
+		ctx.Done()
+		t.goTest.Skipf("Skipping %q: number of clusters %d is below required min %d",
+			t.goTest.Name(), len(t.s.Environment().Clusters()), t.requiredMinClusters)
+		return
+	}
+
+	if t.requiredMaxClusters > 0 && len(t.s.Environment().Clusters()) > t.requiredMaxClusters {
+		ctx.Done()
+		t.goTest.Skipf("Skipping %q: number of clusters %d is above required max %d",
+			t.goTest.Name(), len(t.s.Environment().Clusters()), t.requiredMaxClusters)
+		return
+	}
+
+	start := time.Now()
+
+	scopes.Framework.Infof("=== BEGIN: Test: '%s[%s]' ===", rt.suiteContext().Settings().TestID, t.goTest.Name())
+
 	// Initial setup if we're running in Parallel.
 	if parallel {
 		// Inform the parent, who will need to call ctx.Done asynchronously.
@@ -166,30 +263,29 @@ func (t *Test) doRun(ctx *testContext, fn func(ctx TestContext), parallel bool) 
 		t.goTest.Parallel()
 	}
 
-	t.ctx = ctx
-
-	if t.requiredEnv != "" && t.s.Environment().EnvironmentName() != t.requiredEnv {
-		ctx.Done()
-		t.goTest.Skipf("Skipping %q: expected environment not found: %s", t.goTest.Name(), t.requiredEnv)
-		return
-	}
-
-	start := time.Now()
-
-	scopes.CI.Infof("=== BEGIN: Test: '%s[%s]' ===", rt.suiteContext().Settings().TestID, t.goTest.Name())
 	defer func() {
 		doneFn := func() {
+			message := "passed"
+			if t.goTest.Failed() {
+				message = "failed"
+			}
 			end := time.Now()
-			scopes.CI.Infof("=== DONE:  Test: '%s[%s] (%v)' ===",
+			scopes.Framework.Infof("=== DONE (%s):  Test: '%s[%s] (%v)' ===",
+				message,
 				rt.suiteContext().Settings().TestID,
 				t.goTest.Name(),
 				end.Sub(start))
+			rt.suiteContext().registerOutcome(t)
 			ctx.Done()
+			if t.hasParallelChildren {
+				globalParentLock.Delete(t)
+			}
 		}
 		if t.hasParallelChildren {
 			// If a child is running in parallel, it won't continue until this test returns.
 			// Since ctx.Done() will block until the child test is complete, we run ctx.Done()
 			// asynchronously.
+			globalParentLock.Store(t, struct{}{})
 			go doneFn()
 		} else {
 			doneFn()

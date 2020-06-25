@@ -2,6 +2,10 @@
 
 Make Istio run in docker environment by integrating Consul as a service registry.
 
+## Disclaimer
+
+This example is not included in Istio's release verification testing, so it may not function exactly as documented.
+
 ## Design Principle
 
 The key issue is how to implement the ServiceDiscovery interface functions in Istio.
@@ -25,8 +29,12 @@ The ingress controller is still under construction, routing functionalities can 
 To build all images for the bookinfo sample for the consul adapter, run:
 
 ```bash
-samples/bookinfo/src/build-docker-services.sh
+samples/bookinfo/src/build-services.sh <version> <prefix>
 ```
+
+Where `<version>` is the tag and `<prefix>` is the docker registry to tag the images.
+
+For example: `src/build-services.sh 1.1.0 docker.io/istio`.
 
 For Linux users, configure the `DOCKER_GATEWAY` environment variable
 

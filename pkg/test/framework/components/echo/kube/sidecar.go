@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,15 +19,17 @@ import (
 	"fmt"
 	"strings"
 
-	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/common"
-	"istio.io/istio/pkg/test/kube"
+	kube2 "istio.io/istio/pkg/test/framework/components/environment/kube"
 	"istio.io/istio/pkg/test/util/retry"
 
 	kubeCore "k8s.io/api/core/v1"
@@ -35,7 +37,6 @@ import (
 
 const (
 	proxyContainerName = "istio-proxy"
-	proxyAdminPort     = 15000
 )
 
 var _ echo.Sidecar = &sidecar{}
@@ -44,20 +45,20 @@ type sidecar struct {
 	nodeID       string
 	podNamespace string
 	podName      string
-	accessor     *kube.Accessor
+	cluster      kube2.Cluster
 }
 
-func newSidecar(pod kubeCore.Pod, accessor *kube.Accessor) (*sidecar, error) {
+func newSidecar(pod kubeCore.Pod, cluster kube2.Cluster) (*sidecar, error) {
 	sidecar := &sidecar{
 		podNamespace: pod.Namespace,
 		podName:      pod.Name,
-		accessor:     accessor,
+		cluster:      cluster,
 	}
 
 	// Extract the node ID from Envoy.
 	if err := sidecar.WaitForConfig(func(cfg *envoyAdmin.ConfigDump) (bool, error) {
 		for _, c := range cfg.Configs {
-			if c.TypeUrl == "type.googleapis.com/envoy.admin.v2alpha.BootstrapConfigDump" {
+			if c.TypeUrl == "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump" {
 				cd := envoyAdmin.BootstrapConfigDump{}
 				if err := ptypes.UnmarshalAny(c, &cd); err != nil {
 					return false, err
@@ -162,10 +163,40 @@ func (s *sidecar) ListenersOrFail(t test.Failer) *envoyAdmin.Listeners {
 	return listeners
 }
 
+func (s *sidecar) Stats() (map[string]*dto.MetricFamily, error) {
+	return s.proxyStats()
+}
+
+func (s *sidecar) StatsOrFail(t test.Failer) map[string]*dto.MetricFamily {
+	t.Helper()
+	stats, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stats
+}
+
+func (s *sidecar) proxyStats() (map[string]*dto.MetricFamily, error) {
+	// Exec onto the pod and make a curl request to the admin port, writing
+	command := "pilot-agent request GET /stats/prometheus"
+	response, err := s.cluster.Exec(s.podNamespace, s.podName, proxyContainerName, command)
+	if err != nil {
+		return nil, fmt.Errorf("failed exec on pod %s/%s: %v. Command: %s. Output:\n%s",
+			s.podNamespace, s.podName, err, command, response)
+	}
+
+	parser := expfmt.TextParser{}
+	mfMap, err := parser.TextToMetricFamilies(strings.NewReader(response))
+	if err != nil {
+		return nil, fmt.Errorf("failed parsing prometheus stats: %v", err)
+	}
+	return mfMap, nil
+}
+
 func (s *sidecar) adminRequest(path string, out proto.Message) error {
 	// Exec onto the pod and make a curl request to the admin port, writing
-	command := fmt.Sprintf("curl http://127.0.0.1:%d/%s", proxyAdminPort, path)
-	response, err := s.accessor.Exec(s.podNamespace, s.podName, proxyContainerName, command)
+	command := fmt.Sprintf("pilot-agent request GET %s", path)
+	response, err := s.cluster.Exec(s.podNamespace, s.podName, proxyContainerName, command)
 	if err != nil {
 		return fmt.Errorf("failed exec on pod %s/%s: %v. Command: %s. Output:\n%s",
 			s.podNamespace, s.podName, err, command, response)
@@ -179,7 +210,7 @@ func (s *sidecar) adminRequest(path string, out proto.Message) error {
 }
 
 func (s *sidecar) Logs() (string, error) {
-	return s.accessor.Logs(s.podNamespace, s.podName, proxyContainerName, false)
+	return s.cluster.Logs(s.podNamespace, s.podName, proxyContainerName, false)
 }
 
 func (s *sidecar) LogsOrFail(t test.Failer) string {

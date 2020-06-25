@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -258,9 +258,9 @@ func TestRouteDirective(t *testing.T) {
 		}
 	}
 
-	var expectedStats = map[string]int{
-		"http_mixer_filter.total_check_calls":        2 * len(testCases),
-		"http_mixer_filter.total_remote_check_calls": len(testCases),
+	var expectedStats = map[string]uint64{
+		"http_mixer_filter.total_check_calls":        uint64(2 * len(testCases)),
+		"http_mixer_filter.total_remote_check_calls": uint64(len(testCases)),
 	}
 
 	s.VerifyStats(expectedStats)

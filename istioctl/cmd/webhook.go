@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,11 @@
 package cmd
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"strings"
 	"time"
@@ -72,6 +74,9 @@ type enableCliOptions struct {
 func (opts *enableCliOptions) Validate() error {
 	if !opts.enableValidationWebhook && !opts.enableMutationWebhook {
 		return fmt.Errorf("no webhook to enable")
+	}
+	if len(opts.webhookSecretNameSpace) == 0 {
+		return fmt.Errorf("--namespace <namespace-of-webhook-secret> is required")
 	}
 	if opts.enableValidationWebhook {
 		if len(opts.validationWebhookConfigPath) == 0 {
@@ -189,7 +194,7 @@ istioctl experimental post-install webhook enable --validation --webhook-secret 
 			if err != nil {
 				return fmt.Errorf("err when creating Kubernetes client interface: %v", err)
 			}
-			err = enableWebhookConfig(client, opts)
+			err = enableWebhookConfig(client, opts, cmd.OutOrStdout())
 			if err != nil {
 				return fmt.Errorf("err when enabling webhook configurations: %v", err)
 			}
@@ -216,7 +221,7 @@ istioctl experimental post-install webhook enable --validation --webhook-secret 
 		"The file path of the injection webhook configuration.")
 	flags.StringVar(&opts.validatingWebhookServiceName, "validation-service", "istio-galley",
 		"The service name of the validation webhook to manage.")
-	flags.StringVar(&opts.mutatingWebhookServiceName, "injection-service", "istio-sidecar-injector",
+	flags.StringVar(&opts.mutatingWebhookServiceName, "injection-service", "istio-pilot",
 		"The service name of the injection webhook to manage.")
 	flags.StringVar(&opts.webhookSecretName, "webhook-secret", "",
 		"The name of an existing Kubernetes secret of a webhook. istioctl will verify that the "+
@@ -315,7 +320,7 @@ istioctl experimental post-install webhook status --validation --validation-conf
 			if err != nil {
 				return fmt.Errorf("err when creating Kubernetes client interface: %v", err)
 			}
-			validationErr, injectionErr := displayWebhookConfig(client, opts)
+			validationErr, injectionErr := displayWebhookConfig(client, opts, cmd.OutOrStdout())
 			// Not found is not treated as an error
 			if errors.IsNotFound(validationErr) && errors.IsNotFound(injectionErr) {
 				cmd.Printf("validation webhook (%v) and injection webhook (%v) are not found\n",
@@ -356,61 +361,61 @@ istioctl experimental post-install webhook status --validation --validation-conf
 
 // Create the validatingwebhookconfiguration
 func createValidatingWebhookConfig(k8sClient kubernetes.Interface,
-	config *v1beta1.ValidatingWebhookConfiguration) (*v1beta1.ValidatingWebhookConfiguration, error) {
+	config *v1beta1.ValidatingWebhookConfiguration, writer io.Writer) (*v1beta1.ValidatingWebhookConfiguration, error) {
 	var whConfig, curConfig *v1beta1.ValidatingWebhookConfiguration
 	var err error
 	client := k8sClient.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations()
-	curConfig, err = client.Get(config.Name, metav1.GetOptions{})
+	curConfig, err = client.Get(context.TODO(), config.Name, metav1.GetOptions{})
 	if err == nil {
-		fmt.Printf("update webhook configuration %v\n", config.Name)
+		fmt.Fprintf(writer, "update webhook configuration %v\n", config.Name)
 		config.ObjectMeta.ResourceVersion = curConfig.ObjectMeta.ResourceVersion
-		whConfig, err = client.Update(config)
+		whConfig, err = client.Update(context.TODO(), config, metav1.UpdateOptions{})
 	} else {
-		fmt.Printf("create webhook configuration %v\n", config.Name)
-		whConfig, err = client.Create(config)
+		fmt.Fprintf(writer, "create webhook configuration %v\n", config.Name)
+		whConfig, err = client.Create(context.TODO(), config, metav1.CreateOptions{})
 	}
 	return whConfig, err
 }
 
 // Create the mutatingwebhookconfiguration
 func createMutatingWebhookConfig(k8sClient kubernetes.Interface,
-	config *v1beta1.MutatingWebhookConfiguration) (*v1beta1.MutatingWebhookConfiguration, error) {
+	config *v1beta1.MutatingWebhookConfiguration, writer io.Writer) (*v1beta1.MutatingWebhookConfiguration, error) {
 	var curConfig, whConfig *v1beta1.MutatingWebhookConfiguration
 	var err error
 	client := k8sClient.AdmissionregistrationV1beta1().MutatingWebhookConfigurations()
-	curConfig, err = client.Get(config.Name, metav1.GetOptions{})
+	curConfig, err = client.Get(context.TODO(), config.Name, metav1.GetOptions{})
 	if err == nil {
-		fmt.Printf("update webhook configuration %v\n", config.Name)
+		fmt.Fprintf(writer, "update webhook configuration %v\n", config.Name)
 		config.ObjectMeta.ResourceVersion = curConfig.ObjectMeta.ResourceVersion
-		whConfig, err = client.Update(config)
+		whConfig, err = client.Update(context.TODO(), config, metav1.UpdateOptions{})
 	} else {
-		fmt.Printf("create webhook configuration %v\n", config.Name)
-		whConfig, err = client.Create(config)
+		fmt.Fprintf(writer, "create webhook configuration %v\n", config.Name)
+		whConfig, err = client.Create(context.TODO(), config, metav1.CreateOptions{})
 	}
 	return whConfig, err
 }
 
 // Enable webhook configurations
-func enableWebhookConfig(client kubernetes.Interface, opt *enableCliOptions) error {
+func enableWebhookConfig(client kubernetes.Interface, opt *enableCliOptions, writer io.Writer) error {
 	var errRet error
 
 	// Read Kubernetes CA certificate that will be used as the CA bundle of the webhook configurations
 	caCert, err := readCACert(client, opt.caCertPath, opt.webhookSecretName, opt.webhookSecretNameSpace,
-		opt.maxTimeForReadingWebhookCert)
+		opt.maxTimeForReadingWebhookCert, writer)
 	if err != nil {
 		errRet = multierror.Append(errRet, fmt.Errorf("err when reading CA certificate: %v", err))
 		return errRet
 	}
-	fmt.Printf("Webhook CA certificate:\n%v\n", string(caCert))
+	fmt.Fprintf(writer, "Webhook CA certificate:\n%v\n", string(caCert))
 
 	if opt.enableValidationWebhook {
-		err := enableValidationWebhookConfig(client, caCert, opt)
+		err := enableValidationWebhookConfig(client, caCert, opt, writer)
 		if err != nil {
 			errRet = multierror.Append(errRet, err)
 		}
 	}
 	if opt.enableMutationWebhook {
-		err := enableMutationWebhookConfig(client, caCert, opt)
+		err := enableMutationWebhookConfig(client, caCert, opt, writer)
 		if err != nil {
 			errRet = multierror.Append(errRet, err)
 		}
@@ -419,10 +424,10 @@ func enableWebhookConfig(client kubernetes.Interface, opt *enableCliOptions) err
 }
 
 // Enable validation webhook configuration
-func enableValidationWebhookConfig(client kubernetes.Interface, caCert []byte, opt *enableCliOptions) error {
+func enableValidationWebhookConfig(client kubernetes.Interface, caCert []byte, opt *enableCliOptions, writer io.Writer) error {
 	// Apply the webhook configuration when the Galley webhook server is running.
 	err := waitForServerRunning(client, namespace, opt.validatingWebhookServiceName,
-		opt.maxTimeForCheckingWebhookServer)
+		opt.maxTimeForCheckingWebhookServer, writer)
 	if err != nil {
 		return fmt.Errorf("err when checking validation webhook server: %v", err)
 	}
@@ -430,7 +435,7 @@ func enableValidationWebhookConfig(client kubernetes.Interface, caCert []byte, o
 	if err != nil {
 		return fmt.Errorf("err when build validatingwebhookconfiguration: %v", err)
 	}
-	_, err = createValidatingWebhookConfig(client, webhookConfig)
+	_, err = createValidatingWebhookConfig(client, webhookConfig, writer)
 	if err != nil {
 		return fmt.Errorf("error when creating validatingwebhookconfiguration: %v", err)
 	}
@@ -438,10 +443,10 @@ func enableValidationWebhookConfig(client kubernetes.Interface, caCert []byte, o
 }
 
 // Enable mutation webhook configuration
-func enableMutationWebhookConfig(client kubernetes.Interface, caCert []byte, opt *enableCliOptions) error {
+func enableMutationWebhookConfig(client kubernetes.Interface, caCert []byte, opt *enableCliOptions, writer io.Writer) error {
 	// Apply the webhook configuration when the Sidecar Injector webhook server is running.
 	err := waitForServerRunning(client, namespace, opt.mutatingWebhookServiceName,
-		opt.maxTimeForCheckingWebhookServer)
+		opt.maxTimeForCheckingWebhookServer, writer)
 	if err != nil {
 		return fmt.Errorf("err when checking injection webhook server: %v", err)
 	}
@@ -449,7 +454,7 @@ func enableMutationWebhookConfig(client kubernetes.Interface, caCert []byte, opt
 	if err != nil {
 		return fmt.Errorf("err when build mutatingwebhookconfiguration: %v", err)
 	}
-	_, err = createMutatingWebhookConfig(client, webhookConfig)
+	_, err = createMutatingWebhookConfig(client, webhookConfig, writer)
 	if err != nil {
 		return fmt.Errorf("error when creating mutatingwebhookconfiguration: %v", err)
 	}
@@ -461,30 +466,33 @@ func disableWebhookConfig(k8sClient kubernetes.Interface, opt *disableCliOptions
 	var validationErr error
 	var injectionErr error
 	if opt.disableValidationWebhook {
-		validationErr = k8sClient.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Delete(opt.validatingWebhookConfigName, &metav1.DeleteOptions{})
+		validationErr = k8sClient.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().
+			Delete(context.TODO(), opt.validatingWebhookConfigName, metav1.DeleteOptions{})
 	}
 	if opt.disableInjectionWebhook {
-		injectionErr = k8sClient.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Delete(opt.mutatingWebhookConfigName, &metav1.DeleteOptions{})
+		injectionErr = k8sClient.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().
+			Delete(context.TODO(), opt.mutatingWebhookConfigName, metav1.DeleteOptions{})
 	}
 	return validationErr, injectionErr
 }
 
 // Display webhook configurations
-func displayWebhookConfig(client kubernetes.Interface, opt *statusCliOptions) (error, error) {
+func displayWebhookConfig(client kubernetes.Interface, opt *statusCliOptions, writer io.Writer) (error, error) {
 	var validationErr error
 	var injectionErr error
 	if opt.validationWebhook {
-		validationErr = displayValidationWebhookConfig(client, opt)
+		validationErr = displayValidationWebhookConfig(client, opt, writer)
 	}
 	if opt.injectionWebhook {
-		injectionErr = displayMutationWebhookConfig(client, opt)
+		injectionErr = displayMutationWebhookConfig(client, opt, writer)
 	}
 	return validationErr, injectionErr
 }
 
 // Display validation webhook configuration
-func displayValidationWebhookConfig(client kubernetes.Interface, opt *statusCliOptions) error {
+func displayValidationWebhookConfig(client kubernetes.Interface, opt *statusCliOptions, writer io.Writer) error {
 	config, err := client.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations().Get(
+		context.TODO(),
 		opt.validatingWebhookConfigName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error getting ValidatingWebhookConfiguration %v: %v", opt.validatingWebhookConfigName, err)
@@ -494,13 +502,14 @@ func displayValidationWebhookConfig(client kubernetes.Interface, opt *statusCliO
 		return fmt.Errorf("error when marshaling ValidatingWebhookConfiguration %v to yaml: %v",
 			opt.validatingWebhookConfigName, err)
 	}
-	fmt.Printf("ValidatingWebhookConfiguration %v is:\n%v\n", opt.validatingWebhookConfigName, string(b))
+	fmt.Fprintf(writer, "ValidatingWebhookConfiguration %v is:\n%v\n", opt.validatingWebhookConfigName, string(b))
 	return nil
 }
 
 // Display mutation webhook configuration
-func displayMutationWebhookConfig(client kubernetes.Interface, opt *statusCliOptions) error {
+func displayMutationWebhookConfig(client kubernetes.Interface, opt *statusCliOptions, writer io.Writer) error {
 	config, err := client.AdmissionregistrationV1beta1().MutatingWebhookConfigurations().Get(
+		context.TODO(),
 		opt.mutatingWebhookConfigName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error getting MutatingWebhookConfiguration %v: %v", opt.mutatingWebhookConfigName, err)
@@ -510,14 +519,15 @@ func displayMutationWebhookConfig(client kubernetes.Interface, opt *statusCliOpt
 		return fmt.Errorf("error when marshaling MutatingWebhookConfiguration %v to yaml: %v",
 			opt.mutatingWebhookConfigName, err)
 	}
-	fmt.Printf("MutatingWebhookConfiguration %v is:\n%v\n", opt.mutatingWebhookConfigName, string(b))
+	fmt.Fprintf(writer, "MutatingWebhookConfiguration %v is:\n%v\n", opt.mutatingWebhookConfigName, string(b))
 	return nil
 }
 
 // Read CA certificate and check whether it is a valid certificate.
 // First try read CA cert from a local file. If no local file, read from CA cert from default service account.
 // Next verify that the webhook certificate is issued by CA cert.
-func readCACert(client kubernetes.Interface, certPath, secretName, secretNamespace string, maxWaitTime time.Duration) ([]byte, error) {
+func readCACert(client kubernetes.Interface, certPath, secretName, secretNamespace string,
+	maxWaitTime time.Duration, writer io.Writer) ([]byte, error) {
 	var caCert []byte
 	var err error
 	if len(certPath) > 0 { // read the CA certificate from a local file
@@ -544,10 +554,10 @@ func readCACert(client kubernetes.Interface, certPath, secretName, secretNamespa
 	for {
 		cert, err = readCertFromSecret(client, secretName, secretNamespace)
 		if err == nil {
-			fmt.Printf("finished reading cert %v/%v\n", secretNamespace, secretName)
+			fmt.Fprintf(writer, "finished reading cert %v/%v\n", secretNamespace, secretName)
 			break
 		}
-		fmt.Printf("could not read secret %v/%v: %v\n", secretNamespace, secretName, err)
+		fmt.Fprintf(writer, "could not read secret %v/%v: %v\n", secretNamespace, secretName, err)
 		select {
 		case <-timerCh:
 			return nil, fmt.Errorf("the secret %v/%v is not readable within %v", secretNamespace, secretName, maxWaitTime)
@@ -566,7 +576,7 @@ func readCACert(client kubernetes.Interface, certPath, secretName, secretNamespa
 	return caCert, nil
 }
 
-func waitForServerRunning(client kubernetes.Interface, namespace, svc string, maxWaitTime time.Duration) error {
+func waitForServerRunning(client kubernetes.Interface, namespace, svc string, maxWaitTime time.Duration, writer io.Writer) error {
 	startTime := time.Now()
 	timerCh := time.After(maxWaitTime - time.Since(startTime))
 	// TODO (lei-tang): the retry here may be implemented through another retry mechanism.
@@ -575,10 +585,10 @@ func waitForServerRunning(client kubernetes.Interface, namespace, svc string, ma
 		// its https server.
 		err := isEndpointReady(client, svc, namespace)
 		if err == nil {
-			fmt.Printf("the server at %v/%v is running\n", namespace, svc)
+			fmt.Fprintf(writer, "the server at %v/%v is running\n", namespace, svc)
 			break
 		}
-		fmt.Printf("the server at %v/%v is not running: %v\n", namespace, svc, err)
+		fmt.Fprintf(writer, "the server at %v/%v is not running: %v\n", namespace, svc, err)
 		select {
 		case <-timerCh:
 			return fmt.Errorf("the server at %v/%v is not running within %v", namespace, svc, maxWaitTime)
@@ -637,7 +647,7 @@ func buildMutatingWebhookConfig(
 
 // Return nil when the endpoint is ready. Otherwise, return an error.
 func isEndpointReady(client kubernetes.Interface, svc, namespace string) error {
-	ep, err := client.CoreV1().Endpoints(namespace).Get(svc, metav1.GetOptions{})
+	ep, err := client.CoreV1().Endpoints(namespace).Get(context.TODO(), svc, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
@@ -654,7 +664,7 @@ func isEndpointReady(client kubernetes.Interface, svc, namespace string) error {
 
 // Read secret of a service account.
 func readCACertFromSA(client kubernetes.Interface, namespace, svcAcctName string) ([]byte, error) {
-	svcAcct, err := client.CoreV1().ServiceAccounts(namespace).Get(svcAcctName, metav1.GetOptions{})
+	svcAcct, err := client.CoreV1().ServiceAccounts(namespace).Get(context.TODO(), svcAcctName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -662,7 +672,7 @@ func readCACertFromSA(client kubernetes.Interface, namespace, svcAcctName string
 		return nil, fmt.Errorf("%v/%v has no secrets", namespace, svcAcctName)
 	}
 	secretName := svcAcct.Secrets[0].Name
-	secret, err := client.CoreV1().Secrets(namespace).Get(secretName, metav1.GetOptions{})
+	secret, err := client.CoreV1().Secrets(namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -678,7 +688,7 @@ func readCACertFromSA(client kubernetes.Interface, namespace, svcAcctName string
 
 // Read certificate from secret
 func readCertFromSecret(client kubernetes.Interface, name, namespace string) ([]byte, error) {
-	secret, err := client.CoreV1().Secrets(namespace).Get(name, metav1.GetOptions{})
+	secret, err := client.CoreV1().Secrets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}

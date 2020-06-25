@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,8 @@ package configdump
 import (
 	"sort"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/golang/protobuf/ptypes"
 )
 
@@ -28,8 +29,22 @@ func (w *Wrapper) GetDynamicClusterDump(stripVersions bool) (*adminapi.ClustersC
 		return nil, err
 	}
 	dac := clusterDump.GetDynamicActiveClusters()
+	// Allow sorting to work even if we don't have the exact same type
+	for i := range dac {
+		dac[i].Cluster.TypeUrl = "type.googleapis.com/envoy.api.v2.Cluster"
+	}
 	sort.Slice(dac, func(i, j int) bool {
-		return dac[i].Cluster.Name < dac[j].Cluster.Name
+		cluster := &xdsapi.Cluster{}
+		err = ptypes.UnmarshalAny(dac[i].Cluster, cluster)
+		if err != nil {
+			return false
+		}
+		name := cluster.Name
+		err = ptypes.UnmarshalAny(dac[j].Cluster, cluster)
+		if err != nil {
+			return false
+		}
+		return name < cluster.Name
 	})
 	if stripVersions {
 		for i := range dac {

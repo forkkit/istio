@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,27 +15,37 @@
 package validate
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/hashicorp/go-multierror"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v2"
+
+	"istio.io/pkg/log"
 
 	mixercrd "istio.io/istio/mixer/pkg/config/crd"
 	mixerstore "istio.io/istio/mixer/pkg/config/store"
 	"istio.io/istio/mixer/pkg/runtime/config/constant"
 	mixervalidate "istio.io/istio/mixer/pkg/validate"
-	"istio.io/istio/pilot/pkg/config/kube/crd"
+	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pkg/config/protocol"
-	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/util/gogoprotomarshal"
 
-	"istio.io/pkg/log"
+	operator_istio "istio.io/istio/operator/pkg/apis/istio"
+	"istio.io/istio/operator/pkg/name"
+	operator_validate "istio.io/istio/operator/pkg/validate"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -65,6 +75,7 @@ Example resource specifications include:
 		constant.InstanceKind:          {},
 		constant.AttributeManifestKind: {},
 	}
+
 	istioDeploymentLabel = []string{
 		"app",
 		"version",
@@ -87,16 +98,26 @@ func checkFields(un *unstructured.Unstructured) error {
 }
 
 func (v *validator) validateResource(istioNamespace string, un *unstructured.Unstructured) error {
-	schema, exists := schemas.Istio.GetByType(crd.CamelCaseToKebabCase(un.GetKind()))
+	gvk := resource.GroupVersionKind{
+		Group:   un.GroupVersionKind().Group,
+		Version: un.GroupVersionKind().Version,
+		Kind:    un.GroupVersionKind().Kind,
+	}
+	// TODO(jasonwzm) remove this when multi-version is supported. v1beta1 shares the same
+	// schema as v1lalpha3. Fake conversion and validate against v1alpha3.
+	if gvk.Group == name.NetworkingAPIGroupName && gvk.Version == "v1beta1" {
+		gvk.Version = "v1alpha3"
+	}
+	schema, exists := collections.Pilot.FindByGroupVersionKind(gvk)
 	if exists {
-		obj, err := crd.ConvertObjectFromUnstructured(schema, un, "")
+		obj, err := convertObjectFromUnstructured(schema, un, "")
 		if err != nil {
 			return fmt.Errorf("cannot parse proto message: %v", err)
 		}
 		if err = checkFields(un); err != nil {
 			return err
 		}
-		return schema.Validate(obj.Name, obj.Namespace, obj.Spec)
+		return schema.Resource().ValidateProto(obj.Name, obj.Namespace, obj.Spec)
 	}
 
 	if v.mixerValidator != nil && un.GetAPIVersion() == mixerAPIVersion {
@@ -123,15 +144,15 @@ func (v *validator) validateResource(istioNamespace string, un *unstructured.Uns
 	}
 	var errs error
 	if un.IsList() {
-		_ = un.EachListItem(func(item runtime.Object) error { // nolint: errcheck
+		_ = un.EachListItem(func(item runtime.Object) error {
 			castItem := item.(*unstructured.Unstructured)
-			if castItem.GetKind() == "Service" {
+			if castItem.GetKind() == name.ServiceStr {
 				err := v.validateServicePortPrefix(istioNamespace, castItem)
 				if err != nil {
 					errs = multierror.Append(errs, err)
 				}
 			}
-			if castItem.GetKind() == "Deployment" {
+			if castItem.GetKind() == name.DeploymentStr {
 				v.validateDeploymentLabel(istioNamespace, castItem)
 			}
 			return nil
@@ -141,14 +162,43 @@ func (v *validator) validateResource(istioNamespace string, un *unstructured.Uns
 	if errs != nil {
 		return errs
 	}
-	if un.GetKind() == "Service" {
+	if un.GetKind() == name.ServiceStr {
 		return v.validateServicePortPrefix(istioNamespace, un)
 	}
 
-	if un.GetKind() == "Deployment" {
+	if un.GetKind() == name.DeploymentStr {
 		v.validateDeploymentLabel(istioNamespace, un)
 		return nil
 	}
+
+	if un.GetAPIVersion() == "install.istio.io/v1alpha1" {
+		if un.GetKind() == "IstioOperator" {
+			if err := checkFields(un); err != nil {
+				return err
+			}
+
+			// IstioOperator isn't part of pkg/config/schema/collections,
+			// usual conversion not available.  Convert unstructured to string
+			// and ask operator code to check.
+
+			un.SetCreationTimestamp(metav1.Time{}) // UnmarshalIstioOperator chokes on these
+			by, err := json.Marshal(un)
+			if err != nil {
+				return err
+			}
+
+			iop, err := operator_istio.UnmarshalIstioOperator(string(by))
+			if err != nil {
+				return err
+			}
+
+			return operator_validate.CheckIstioOperator(iop, true)
+		}
+	}
+
+	// Didn't really validate.  This is OK, as we often get non-Istio Kubernetes YAML
+	// we can't complain about.
+
 	return nil
 }
 
@@ -273,7 +323,7 @@ func NewValidateCommand(istioNamespace *string) *cobra.Command {
 
 	c := &cobra.Command{
 		Use:   "validate -f FILENAME [options]",
-		Short: "Validate Istio policy and rules",
+		Short: "Validate Istio policy and rules (NOTE: validate is deprecated and will be removed in 1.6. Use 'istioctl analyze' to validate configuration.)",
 		Example: `
 		# Validate bookinfo-gateway.yaml
 		istioctl validate -f bookinfo-gateway.yaml
@@ -283,6 +333,9 @@ func NewValidateCommand(istioNamespace *string) *cobra.Command {
 
 		# Validate current services under 'default' namespace within the cluster
 		kubectl get services -o yaml |istioctl validate -f -
+
+		# Also see the related command 'istioctl analyze'
+		istioctl analyze samples/bookinfo/networking/bookinfo-gateway.yaml
 `,
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
@@ -337,4 +390,52 @@ func handleNamespace(istioNamespace string) string {
 		istioNamespace = controller.IstioNamespace
 	}
 	return istioNamespace
+}
+
+// TODO(nmittler): Remove this once Pilot migrates to galley schema.
+func convertObjectFromUnstructured(schema collection.Schema, un *unstructured.Unstructured, domain string) (*model.Config, error) {
+	data, err := fromSchemaAndJSONMap(schema, un.Object["spec"])
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.Config{
+		ConfigMeta: model.ConfigMeta{
+			GroupVersionKind:  schema.Resource().GroupVersionKind(),
+			Name:              un.GetName(),
+			Namespace:         un.GetNamespace(),
+			Domain:            domain,
+			Labels:            un.GetLabels(),
+			Annotations:       un.GetAnnotations(),
+			ResourceVersion:   un.GetResourceVersion(),
+			CreationTimestamp: un.GetCreationTimestamp().Time,
+		},
+		Spec: data,
+	}, nil
+}
+
+// TODO(nmittler): Remove this once Pilot migrates to galley schema.
+func fromSchemaAndYAML(schema collection.Schema, yml string) (proto.Message, error) {
+	pb, err := schema.Resource().NewProtoInstance()
+	if err != nil {
+		return nil, err
+	}
+	if err = gogoprotomarshal.ApplyYAMLStrict(yml, pb); err != nil {
+		return nil, err
+	}
+	return pb, nil
+}
+
+// TODO(nmittler): Remove this once Pilot migrates to galley schema.
+func fromSchemaAndJSONMap(schema collection.Schema, data interface{}) (proto.Message, error) {
+	// Marshal to YAML bytes
+	str, err := yaml.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	out, err := fromSchemaAndYAML(schema, string(str))
+	if err != nil {
+		return nil, multierror.Prefix(err, fmt.Sprintf("YAML decoding error: %v", string(str)))
+	}
+	return out, nil
 }

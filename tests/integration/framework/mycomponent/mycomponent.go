@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ package mycomponent
 import (
 	"testing"
 
-	"istio.io/istio/pkg/test/framework/components/environment"
 	"istio.io/istio/pkg/test/framework/resource"
+	"istio.io/istio/pkg/test/framework/resource/environment"
 )
 
 // Instance is an example component. Consider implementing your component as an interface, so that others can add
@@ -40,9 +40,6 @@ func New(ctx resource.Context, cfg Config) (i Instance, err error) {
 	// You need to provide environment specific implementations of your component. If you support only specific
 	// environments, then return resource.UnsupportedEnvironment to signal the situation.
 	switch ctx.Environment().EnvironmentName() {
-	case environment.Native:
-		i = newNative(ctx, cfg)
-
 	case environment.Kube:
 		i = newKube(ctx, cfg)
 

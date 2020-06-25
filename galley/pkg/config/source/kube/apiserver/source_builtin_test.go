@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 package apiserver_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -22,12 +23,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"istio.io/istio/galley/pkg/config/event"
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/pkg/log"
+
 	"istio.io/istio/galley/pkg/config/scope"
+	"istio.io/istio/galley/pkg/config/testing/fixtures"
 	"istio.io/istio/galley/pkg/config/testing/k8smeta"
 	"istio.io/istio/galley/pkg/testing/mock"
-	"istio.io/pkg/log"
+	"istio.io/istio/pkg/config/event"
+	"istio.io/istio/pkg/config/resource"
+	resource2 "istio.io/istio/pkg/config/schema/resource"
 )
 
 const (
@@ -51,6 +55,8 @@ var (
 		},
 		ResourceVersion: "rv1",
 	}
+
+	metadata = k8smeta.MustGet().KubeCollections()
 )
 
 func TestBasic(t *testing.T) {
@@ -65,12 +71,12 @@ func TestBasic(t *testing.T) {
 	g.Expect(err).To(BeNil())
 
 	// Start the source.
-	s := newOrFail(t, k, k8smeta.MustGet().KubeSource().Resources(), nil)
+	s := newOrFail(t, k, k8smeta.MustGet().KubeCollections(), nil)
 	acc := start(s)
 	defer s.Stop()
 
-	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(6))
-	for i := 0; i < 6; i++ {
+	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(7))
+	for i := 0; i < 7; i++ {
 		g.Expect(acc.EventsWithoutOrigins()[i].Kind).Should(Equal(event.FullSync))
 	}
 
@@ -85,12 +91,13 @@ func TestBasic(t *testing.T) {
 	node.Namespace = "" // nodes don't have namespaces.
 
 	// Add the resource.
-	if node, err = client.CoreV1().Nodes().Create(node); err != nil {
+	if node, err = client.CoreV1().Nodes().Create(context.TODO(), node, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed creating node: %v", err)
 	}
 
-	expected := event.AddFor(k8smeta.K8SCoreV1Nodes, toResource(node, &node.Spec))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected := event.AddFor(k8smeta.K8SCoreV1Nodes, toResource(node, &node.Spec, k8smeta.K8SCoreV1Nodes.Resource()))
+
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 }
 
 func TestNodes(t *testing.T) {
@@ -105,12 +112,12 @@ func TestNodes(t *testing.T) {
 	g.Expect(err).To(BeNil())
 
 	// Start the source.
-	s := newOrFail(t, k, k8smeta.MustGet().KubeSource().Resources(), nil)
+	s := newOrFail(t, k, metadata, nil)
 	acc := start(s)
 	defer s.Stop()
 
-	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(6))
-	for i := 0; i < 6; i++ {
+	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(7))
+	for i := 0; i < 7; i++ {
 		g.Expect(acc.EventsWithoutOrigins()[i].Kind).Should(Equal(event.FullSync))
 	}
 	acc.Clear()
@@ -124,12 +131,12 @@ func TestNodes(t *testing.T) {
 	node.Namespace = "" // nodes don't have namespaces.
 
 	// Add the resource.
-	if node, err = client.CoreV1().Nodes().Create(node); err != nil {
+	if node, err = client.CoreV1().Nodes().Create(context.TODO(), node, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed creating node: %v", err)
 	}
 
-	expected := event.AddFor(k8smeta.K8SCoreV1Nodes, toResource(node, &node.Spec))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected := event.AddFor(k8smeta.K8SCoreV1Nodes, toResource(node, &node.Spec, k8smeta.K8SCoreV1Nodes.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 
 	acc.Clear()
 
@@ -137,16 +144,16 @@ func TestNodes(t *testing.T) {
 	node = node.DeepCopy()
 	node.Spec.PodCIDR = "10.20.0.0/32"
 	node.ResourceVersion = "rv2"
-	if _, err = client.CoreV1().Nodes().Update(node); err != nil {
+	if _, err = client.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed updating node: %v", err)
 	}
 
-	expected = event.UpdateFor(k8smeta.K8SCoreV1Nodes, toResource(node, &node.Spec))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected = event.UpdateFor(k8smeta.K8SCoreV1Nodes, toResource(node, &node.Spec, k8smeta.K8SCoreV1Nodes.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 
 	acc.Clear()
 
-	if _, err = client.CoreV1().Nodes().Update(node); err != nil {
+	if _, err = client.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed updating node: %v", err)
 	}
 	g.Consistently(acc.EventsWithoutOrigins).Should(BeEmpty())
@@ -154,11 +161,11 @@ func TestNodes(t *testing.T) {
 	acc.Clear()
 
 	// Delete the resource.
-	if err = client.CoreV1().Nodes().Delete(node.Name, nil); err != nil {
+	if err = client.CoreV1().Nodes().Delete(context.TODO(), node.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("failed deleting node: %v", err)
 	}
-	expected = event.DeleteForResource(k8smeta.K8SCoreV1Nodes, toResource(node, &node.Spec))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected = event.DeleteForResource(k8smeta.K8SCoreV1Nodes, toResource(node, &node.Spec, k8smeta.K8SCoreV1Nodes.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 }
 
 func TestPods(t *testing.T) {
@@ -173,12 +180,12 @@ func TestPods(t *testing.T) {
 	g.Expect(err).To(BeNil())
 
 	// Start the source.
-	s := newOrFail(t, k, k8smeta.MustGet().KubeSource().Resources(), nil)
+	s := newOrFail(t, k, metadata, nil)
 	acc := start(s)
 	defer s.Stop()
 
-	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(6))
-	for i := 0; i < 6; i++ {
+	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(7))
+	for i := 0; i < 7; i++ {
 		g.Expect(acc.EventsWithoutOrigins()[i].Kind).Should(Equal(event.FullSync))
 	}
 	acc.Clear()
@@ -203,11 +210,11 @@ func TestPods(t *testing.T) {
 		},
 	}
 
-	if pod, err = client.CoreV1().Pods(namespace).Create(pod); err != nil {
+	if pod, err = client.CoreV1().Pods(namespace).Create(context.TODO(), pod, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed creating pod: %v", err)
 	}
-	expected := event.AddFor(k8smeta.K8SCoreV1Pods, toResource(pod, pod))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected := event.AddFor(k8smeta.K8SCoreV1Pods, toResource(pod, pod, k8smeta.K8SCoreV1Pods.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 
 	acc.Clear()
 
@@ -215,16 +222,16 @@ func TestPods(t *testing.T) {
 	pod = pod.DeepCopy()
 	pod.Spec.Containers[0].Name = "c2"
 	pod.ResourceVersion = "rv2"
-	if _, err = client.CoreV1().Pods(namespace).Update(pod); err != nil {
+	if _, err = client.CoreV1().Pods(namespace).Update(context.TODO(), pod, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed updating pod: %v", err)
 	}
-	expected = event.UpdateFor(k8smeta.K8SCoreV1Pods, toResource(pod, pod))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected = event.UpdateFor(k8smeta.K8SCoreV1Pods, toResource(pod, pod, k8smeta.K8SCoreV1Pods.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 
 	acc.Clear()
 
 	// Update event with no changes, should yield no events.
-	if _, err = client.CoreV1().Pods(namespace).Update(pod); err != nil {
+	if _, err = client.CoreV1().Pods(namespace).Update(context.TODO(), pod, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed updating pod: %v", err)
 	}
 	g.Consistently(acc.EventsWithoutOrigins).Should(BeEmpty())
@@ -232,11 +239,11 @@ func TestPods(t *testing.T) {
 	acc.Clear()
 
 	// Delete the resource.
-	if err = client.CoreV1().Pods(namespace).Delete(pod.Name, nil); err != nil {
+	if err = client.CoreV1().Pods(namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("failed deleting pod: %v", err)
 	}
-	expected = event.DeleteForResource(k8smeta.K8SCoreV1Pods, toResource(pod, pod))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected = event.DeleteForResource(k8smeta.K8SCoreV1Pods, toResource(pod, pod, k8smeta.K8SCoreV1Pods.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 }
 
 func TestServices(t *testing.T) {
@@ -251,12 +258,12 @@ func TestServices(t *testing.T) {
 	g.Expect(err).To(BeNil())
 
 	// Start the source.
-	s := newOrFail(t, k, k8smeta.MustGet().KubeSource().Resources(), nil)
+	s := newOrFail(t, k, metadata, nil)
 	acc := start(s)
 	defer s.Stop()
 
-	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(6))
-	for i := 0; i < 6; i++ {
+	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(7))
+	for i := 0; i < 7; i++ {
 		g.Expect(acc.EventsWithoutOrigins()[i].Kind).Should(Equal(event.FullSync))
 	}
 	acc.Clear()
@@ -276,11 +283,11 @@ func TestServices(t *testing.T) {
 	}
 
 	// Add the resource.
-	if svc, err = client.CoreV1().Services(namespace).Create(svc); err != nil {
+	if svc, err = client.CoreV1().Services(namespace).Create(context.TODO(), svc, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed creating service: %v", err)
 	}
-	expected := event.AddFor(k8smeta.K8SCoreV1Services, toResource(svc, &svc.Spec))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected := event.AddFor(k8smeta.K8SCoreV1Services, toResource(svc, &svc.Spec, k8smeta.K8SCoreV1Services.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 
 	acc.Clear()
 
@@ -288,16 +295,16 @@ func TestServices(t *testing.T) {
 	svc = svc.DeepCopy()
 	svc.Spec.Ports[0].Port = 8080
 	svc.ResourceVersion = "rv2"
-	if _, err = client.CoreV1().Services(namespace).Update(svc); err != nil {
+	if _, err = client.CoreV1().Services(namespace).Update(context.TODO(), svc, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed updating service: %v", err)
 	}
-	expected = event.UpdateFor(k8smeta.K8SCoreV1Services, toResource(svc, &svc.Spec))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected = event.UpdateFor(k8smeta.K8SCoreV1Services, toResource(svc, &svc.Spec, k8smeta.K8SCoreV1Services.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 
 	acc.Clear()
 
 	// Update event with no changes, should yield no events.
-	if _, err = client.CoreV1().Services(namespace).Update(svc); err != nil {
+	if _, err = client.CoreV1().Services(namespace).Update(context.TODO(), svc, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed updating service: %v", err)
 	}
 	g.Consistently(acc.EventsWithoutOrigins).Should(BeEmpty())
@@ -305,11 +312,11 @@ func TestServices(t *testing.T) {
 	acc.Clear()
 
 	// Delete the resource.
-	if err = client.CoreV1().Services(namespace).Delete(svc.Name, nil); err != nil {
+	if err = client.CoreV1().Services(namespace).Delete(context.TODO(), svc.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("failed deleting service: %v", err)
 	}
-	expected = event.DeleteForResource(k8smeta.K8SCoreV1Services, toResource(svc, &svc.Spec))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected = event.DeleteForResource(k8smeta.K8SCoreV1Services, toResource(svc, &svc.Spec, k8smeta.K8SCoreV1Services.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 }
 
 func TestEndpoints(t *testing.T) {
@@ -324,12 +331,12 @@ func TestEndpoints(t *testing.T) {
 	g.Expect(err).To(BeNil())
 
 	// Start the source.
-	s := newOrFail(t, k, k8smeta.MustGet().KubeSource().Resources(), nil)
+	s := newOrFail(t, k, metadata, nil)
 	acc := start(s)
 	defer s.Stop()
 
-	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(6))
-	for i := 0; i < 6; i++ {
+	g.Eventually(acc.EventsWithoutOrigins).Should(HaveLen(7))
+	for i := 0; i < 7; i++ {
 		g.Expect(acc.EventsWithoutOrigins()[i].Kind).Should(Equal(event.FullSync))
 	}
 	acc.Clear()
@@ -356,11 +363,11 @@ func TestEndpoints(t *testing.T) {
 	}
 
 	// Add the resource.
-	if eps, err = client.CoreV1().Endpoints(namespace).Create(eps); err != nil {
+	if eps, err = client.CoreV1().Endpoints(namespace).Create(context.TODO(), eps, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed creating endpoints: %v", err)
 	}
-	expected := event.AddFor(k8smeta.K8SCoreV1Endpoints, toResource(eps, eps))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected := event.AddFor(k8smeta.K8SCoreV1Endpoints, toResource(eps, eps, k8smeta.K8SCoreV1Endpoints.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 
 	acc.Clear()
 
@@ -368,11 +375,11 @@ func TestEndpoints(t *testing.T) {
 	eps = eps.DeepCopy()
 	eps.Subsets[0].Ports[0].Port = 8080
 	eps.ResourceVersion = "rv2"
-	if _, err = client.CoreV1().Endpoints(namespace).Update(eps); err != nil {
+	if _, err = client.CoreV1().Endpoints(namespace).Update(context.TODO(), eps, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed updating endpoints: %v", err)
 	}
-	expected = event.UpdateFor(k8smeta.K8SCoreV1Endpoints, toResource(eps, eps))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected = event.UpdateFor(k8smeta.K8SCoreV1Endpoints, toResource(eps, eps, k8smeta.K8SCoreV1Endpoints.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 
 	acc.Clear()
 
@@ -380,29 +387,30 @@ func TestEndpoints(t *testing.T) {
 	// Changing only the resource version, should have not result in an update.
 	eps = eps.DeepCopy()
 	eps.ResourceVersion = "rv3"
-	if _, err = client.CoreV1().Endpoints(namespace).Update(eps); err != nil {
+	if _, err = client.CoreV1().Endpoints(namespace).Update(context.TODO(), eps, metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("failed updating endpoints: %v", err)
 	}
 	g.Consistently(acc.EventsWithoutOrigins).Should(BeEmpty())
 
 	// Delete the resource.
-	if err = client.CoreV1().Endpoints(namespace).Delete(eps.Name, nil); err != nil {
+	if err = client.CoreV1().Endpoints(namespace).Delete(context.TODO(), eps.Name, metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("failed deleting endpoints: %v", err)
 	}
-	expected = event.DeleteForResource(k8smeta.K8SCoreV1Endpoints, toResource(eps, eps))
-	g.Eventually(acc.EventsWithoutOrigins).Should(ConsistOf(expected))
+	expected = event.DeleteForResource(k8smeta.K8SCoreV1Endpoints, toResource(eps, eps, k8smeta.K8SCoreV1Endpoints.Resource()))
+	fixtures.ExpectEventsWithoutOriginsEventually(t, acc, expected)
 }
 
-func toResource(objectMeta metav1.Object, item proto.Message) *resource.Entry {
-	return &resource.Entry{
+func toResource(objectMeta metav1.Object, item proto.Message, schema resource2.Schema) *resource.Instance {
+	return &resource.Instance{
 		Metadata: resource.Metadata{
-			Name:        resource.NewName(objectMeta.GetNamespace(), objectMeta.GetName()),
+			FullName:    resource.NewFullName(resource.Namespace(objectMeta.GetNamespace()), resource.LocalName(objectMeta.GetName())),
 			Version:     resource.Version(objectMeta.GetResourceVersion()),
 			CreateTime:  fakeCreateTime,
 			Labels:      objectMeta.GetLabels(),
 			Annotations: objectMeta.GetAnnotations(),
+			Schema:      schema,
 		},
-		Item: item,
+		Message: item,
 	}
 }
 

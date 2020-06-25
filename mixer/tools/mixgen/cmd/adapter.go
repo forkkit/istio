@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ import (
 
 	"istio.io/istio/mixer/cmd/shared"
 	"istio.io/istio/mixer/pkg/runtime/config/constant"
-	"istio.io/pkg/env"
+	"istio.io/istio/pkg/test/env"
 )
 
 func adapterCfgCmd(rawArgs []string, printf, fatalf shared.FormatFn) *cobra.Command {
@@ -112,9 +112,8 @@ spec:
 		}
 	}
 
-	repoRoot := env.RegisterStringVar("REPO_ROOT", "", "Absolute path to the base of the source repository.").Get()
 	adapterObj := &adapterCRVar{
-		RawCommand:   strings.Replace(rawCommand, repoRoot, "$REPO_ROOT", -1),
+		RawCommand:   strings.Replace(rawCommand, env.IstioSrc, "$REPO_ROOT", -1),
 		Name:         name,
 		Namespace:    namespace,
 		Description:  description,

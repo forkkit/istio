@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import (
 	"istio.io/istio/tests/integration/framework/mycomponent"
 
 	"istio.io/istio/pkg/test/framework"
-	"istio.io/istio/pkg/test/framework/components/environment"
 	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
 )
@@ -35,7 +34,7 @@ func mysetup(c resource.Context) error {
 
 	// You can use the suite context to perform various operations. For example you can create folders or temp
 	// folders as part of your operations.
-	_, err := c.CreateDirectory("example_foo")
+	_, err := c.CreateTmpDirectory("example_foo")
 	if err != nil {
 		return err
 	}
@@ -50,10 +49,6 @@ func mysetup(c resource.Context) error {
 	return nil
 }
 
-func setupNative(_ resource.Context) error {
-	return nil
-}
-
 func setupKube(_ resource.Context) error {
 	return nil
 }
@@ -63,7 +58,7 @@ func TestStyle1(t *testing.T) {
 	// is cleaned up correctly.
 	framework.Run(t, func(ctx framework.TestContext) {
 		// You can use the framework.TestContext methods directly to interact with the framework.
-		ctx.CreateDirectoryOrFail("boo")
+		ctx.CreateTmpDirectoryOrFail("boo")
 
 		// You can allocate components at the test level as well. mc2's life will be scoped to this lambda call.
 		mc2 := mycomponent.NewOrFail(t, ctx, mycomponent.Config{DoStuffElegantly: true})
@@ -79,7 +74,6 @@ func TestStyle2(t *testing.T) {
 	// You can specify additional constraints using the more verbose form
 	framework.NewTest(t).
 		Label(label.Postsubmit).
-		RequiresEnvironment(environment.Kube).
 		Run(func(ctx framework.TestContext) {
 
 			// This tests will run only on Kube environment as Presubmit. Note that the suite level requirements will

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -26,7 +27,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/serviceregistry/kube"
 	"istio.io/istio/pkg/config/labels"
 )
 
@@ -36,20 +36,20 @@ import (
 func initTestEnv(t *testing.T, ki kubernetes.Interface, fx *FakeXdsUpdater) {
 	cleanup(ki)
 	for _, n := range []string{"nsa", "nsb"} {
-		_, err := ki.CoreV1().Namespaces().Create(&v1.Namespace{
+		_, err := ki.CoreV1().Namespaces().Create(context.TODO(), &v1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: n,
 				Labels: map[string]string{
 					"istio-injection": "enabled",
 				},
 			},
-		})
+		}, metav1.CreateOptions{})
 		if err != nil {
 			t.Fatalf("failed creating test namespace: %v", err)
 		}
 
 		// K8S 1.10 also checks if service account exists
-		_, err = ki.CoreV1().ServiceAccounts(n).Create(&v1.ServiceAccount{
+		_, err = ki.CoreV1().ServiceAccounts(n).Create(context.TODO(), &v1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "default",
 				Annotations: map[string]string{
@@ -62,12 +62,12 @@ func initTestEnv(t *testing.T, ki kubernetes.Interface, fx *FakeXdsUpdater) {
 					UID:  "1",
 				},
 			},
-		})
+		}, metav1.CreateOptions{})
 		if err != nil {
 			t.Fatalf("failed creating test service account: %v", err)
 		}
 
-		_, err = ki.CoreV1().Secrets(n).Create(&v1.Secret{
+		_, err = ki.CoreV1().Secrets(n).Create(context.TODO(), &v1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "default-token-2",
 				Annotations: map[string]string{
@@ -79,7 +79,7 @@ func initTestEnv(t *testing.T, ki kubernetes.Interface, fx *FakeXdsUpdater) {
 			Data: map[string][]byte{
 				"token": []byte("1"),
 			},
-		})
+		}, metav1.CreateOptions{})
 		if err != nil {
 			t.Fatalf("failed creating test secret: %v", err)
 		}
@@ -90,29 +90,77 @@ func initTestEnv(t *testing.T, ki kubernetes.Interface, fx *FakeXdsUpdater) {
 func cleanup(ki kubernetes.Interface) {
 	for _, n := range []string{"nsa", "nsb"} {
 		n := n
-		pods, err := ki.CoreV1().Pods(n).List(metav1.ListOptions{})
+		pods, err := ki.CoreV1().Pods(n).List(context.TODO(), metav1.ListOptions{})
 		if err == nil {
 			// Make sure the pods don't exist
 			for _, pod := range pods.Items {
-				_ = ki.CoreV1().Pods(pod.Namespace).Delete(pod.Name, nil)
+				_ = ki.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
 			}
 		}
 	}
 }
 
 func TestPodCache(t *testing.T) {
-	t.Run("localApiserver", func(t *testing.T) {
-		c, fx := newLocalController(t)
-		defer c.Stop()
-		defer cleanup(c.client)
-		testPodCache(t, c, fx)
-	})
 	t.Run("fakeApiserver", func(t *testing.T) {
 		t.Parallel()
-		c, fx := newFakeController(t)
-		defer c.Stop()
-		testPodCache(t, c, fx)
+		testPodCache(t)
 	})
+}
+
+// Regression test for https://github.com/istio/istio/issues/20676
+func TestIPReuse(t *testing.T) {
+	c, fx := newFakeControllerWithOptions(fakeControllerOptions{mode: EndpointsOnly})
+	defer c.Stop()
+	initTestEnv(t, c.client, fx)
+
+	cache.WaitForCacheSync(c.stop, c.nodeMetadataInformer.HasSynced, c.pods.informer.HasSynced,
+		c.serviceInformer.HasSynced, c.endpoints.HasSynced)
+
+	createPod(t, c, "128.0.0.1", "pod")
+	if p, f := c.pods.getPodKey("128.0.0.1"); !f || p != "ns/pod" {
+		t.Fatalf("unexpected pod: %v", p)
+	}
+
+	// Change the pod IP. This can happen if the pod moves to another node, for example.
+	createPod(t, c, "128.0.0.2", "pod")
+	if p, f := c.pods.getPodKey("128.0.0.2"); !f || p != "ns/pod" {
+		t.Fatalf("unexpected pod: %v", p)
+	}
+	if p, f := c.pods.getPodKey("128.0.0.1"); f {
+		t.Fatalf("expected no pod, got pod: %v", p)
+	}
+
+	// A new pod is created with the old IP. We should get new-pod, not pod
+	createPod(t, c, "128.0.0.1", "new-pod")
+	if p, f := c.pods.getPodKey("128.0.0.1"); !f || p != "ns/new-pod" {
+		t.Fatalf("unexpected pod: %v", p)
+	}
+
+	// A new pod is created with the same IP. In theory this should never happen, but maybe we miss an update somehow.
+	createPod(t, c, "128.0.0.1", "another-pod")
+	if p, f := c.pods.getPodKey("128.0.0.1"); !f || p != "ns/another-pod" {
+		t.Fatalf("unexpected pod: %v", p)
+	}
+
+	err := c.client.CoreV1().Pods("ns").Delete(context.TODO(), "another-pod", metav1.DeleteOptions{})
+	if err != nil {
+		t.Fatalf("Cannot delete pod: %v", err)
+	}
+	if err := wait.Poll(10*time.Millisecond, 5*time.Second, func() (bool, error) {
+		if _, ok := c.pods.getPodKey("128.0.0.1"); ok {
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+}
+
+func createPod(t *testing.T, c *Controller, ip, name string) {
+	addPods(t, c, generatePod(ip, name, "ns", "1", "", map[string]string{}, map[string]string{}))
+	if err := waitForPod(c, ip); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func waitForPod(c *Controller, ip string) error {
@@ -126,7 +174,13 @@ func waitForPod(c *Controller, ip string) error {
 	})
 }
 
-func testPodCache(t *testing.T, c *Controller, fx *FakeXdsUpdater) {
+func testPodCache(t *testing.T) {
+	c, fx := newFakeControllerWithOptions(fakeControllerOptions{
+		mode:              EndpointsOnly,
+		watchedNamespaces: "nsa,nsb",
+	})
+	defer c.Stop()
+
 	initTestEnv(t, c.client, fx)
 
 	// Namespace must be lowercase (nsA doesn't work)
@@ -134,15 +188,18 @@ func testPodCache(t *testing.T, c *Controller, fx *FakeXdsUpdater) {
 		generatePod("128.0.0.1", "cpod1", "nsa", "", "", map[string]string{"app": "test-app"}, map[string]string{}),
 		generatePod("128.0.0.2", "cpod2", "nsa", "", "", map[string]string{"app": "prod-app-1"}, map[string]string{}),
 		generatePod("128.0.0.3", "cpod3", "nsb", "", "", map[string]string{"app": "prod-app-2"}, map[string]string{}),
+
+		// Pods in namespaces not watched by the controller.
+		generatePod("128.0.0.4", "cpod4", "nsc", "", "", map[string]string{"app": "prod-app-3"}, map[string]string{}),
 	}
-	cache.WaitForCacheSync(c.stop, c.nodes.informer.HasSynced, c.pods.informer.HasSynced,
-		c.services.informer.HasSynced, c.endpoints.informer.HasSynced)
+	cache.WaitForCacheSync(c.stop, c.nodeMetadataInformer.HasSynced, c.pods.informer.HasSynced,
+		c.serviceInformer.HasSynced, c.endpoints.HasSynced)
 
 	for _, pod := range pods {
 		pod := pod
 		addPods(t, c, pod)
 		// Wait for the workload event
-		waitForPod(c, pod.Status.PodIP)
+		_ = waitForPod(c, pod.Status.PodIP)
 	}
 
 	// Verify podCache
@@ -152,19 +209,26 @@ func testPodCache(t *testing.T, c *Controller, fx *FakeXdsUpdater) {
 		"128.0.0.3": {"app": "prod-app-2"},
 	}
 	for addr, wantTag := range wantLabels {
-		tag, found := c.pods.labelsByIP(addr)
-		if !found {
+		pod := c.pods.getPodByIP(addr)
+		if pod == nil {
 			t.Error("Not found ", addr)
 			continue
 		}
-		if !reflect.DeepEqual(wantTag, tag) {
-			t.Errorf("Expected %v got %v", wantTag, tag)
+		if !reflect.DeepEqual(wantTag, labels.Instance(pod.Labels)) {
+			t.Errorf("Expected %v got %v", wantTag, labels.Instance(pod.Labels))
 		}
 	}
 
-	// Former 'wantNotFound' test. A pod not in the cache results in found = false
-	_, found := c.pods.labelsByIP("128.0.0.4")
-	if found {
+	// This pod exists, but should not be in the cache because it is in a
+	// namespace not watched by the controller.
+	pod := c.pods.getPodByIP("128.0.0.4")
+	if pod != nil {
+		t.Error("Expected not found but was found")
+	}
+
+	// This pod should not be in the cache because it never existed.
+	pod = c.pods.getPodByIP("128.0.0.128")
+	if pod != nil {
 		t.Error("Expected not found but was found")
 	}
 }
@@ -172,13 +236,14 @@ func testPodCache(t *testing.T, c *Controller, fx *FakeXdsUpdater) {
 // Checks that events from the watcher create the proper internal structures
 func TestPodCacheEvents(t *testing.T) {
 	t.Parallel()
-	handler := &kube.ChainHandler{}
-	c, fx := newFakeController(t)
-	podCache := newPodCache(cacheHandler{handler: handler}, c)
-
-	f := podCache.event
+	c, fx := newFakeControllerWithOptions(fakeControllerOptions{mode: EndpointsOnly})
+	defer c.Stop()
 
 	ns := "default"
+	podCache := newPodCache(c, Options{WatchedNamespaces: ns})
+
+	f := podCache.onEvent
+
 	ip := "172.0.3.35"
 	pod1 := metav1.ObjectMeta{Name: "pod1", Namespace: ns}
 	if err := f(&v1.Pod{ObjectMeta: pod1}, model.EventAdd); err != nil {
@@ -197,7 +262,8 @@ func TestPodCacheEvents(t *testing.T) {
 	}
 
 	pod2 := metav1.ObjectMeta{Name: "pod2", Namespace: ns}
-	if err := f(&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{PodIP: ip, Phase: v1.PodFailed}}, model.EventUpdate); err != nil {
+	if err := f(
+		&v1.Pod{ObjectMeta: pod1, Status: v1.PodStatus{PodIP: ip, Phase: v1.PodFailed}}, model.EventUpdate); err != nil {
 		t.Error(err)
 	}
 	if err := f(&v1.Pod{ObjectMeta: pod2, Status: v1.PodStatus{PodIP: ip, Phase: v1.PodRunning}}, model.EventAdd); err != nil {

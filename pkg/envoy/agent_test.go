@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package envoy
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,9 +27,10 @@ import (
 
 // TestProxy sample struct for proxy
 type TestProxy struct {
-	run     func(interface{}, int, <-chan error) error
-	cleanup func(int)
-	live    func() bool
+	run          func(interface{}, int, <-chan error) error
+	cleanup      func(int)
+	live         func() bool
+	blockChannel chan interface{}
 }
 
 func (tp TestProxy) Run(config interface{}, epoch int, stop <-chan error) error {
@@ -43,6 +45,11 @@ func (tp TestProxy) IsLive() bool {
 		return true
 	}
 	return tp.live()
+}
+
+func (tp TestProxy) Drain() error {
+	tp.blockChannel <- "unblock"
+	return nil
 }
 
 func (tp TestProxy) Cleanup(epoch int) {
@@ -71,7 +78,7 @@ func TestStartExit(t *testing.T) {
 //   * Aborts all proxies
 func TestStartDrain(t *testing.T) {
 	wantEpoch := 0
-	proxiesStarted, wantProxiesStarted := 0, 2
+	proxiesStarted, wantProxiesStarted := 0, 1
 	blockChan := make(chan interface{})
 	ctx, cancel := context.WithCancel(context.Background())
 	startConfig := "start config"
@@ -89,14 +96,10 @@ func TestStartDrain(t *testing.T) {
 				t.Errorf("start wanted config %q, got %q", startConfig, config)
 			}
 			time.Sleep(time.Second * 2) // ensure initial proxy doesn't terminate too quickly
-		} else if currentEpoch == 1 {
-			if _, ok := config.(DrainConfig); !ok {
-				t.Errorf("start expected draining config, got %q", config)
-			}
 		}
 		return nil
 	}
-	a := NewAgent(TestProxy{run: start}, -10*time.Second)
+	a := NewAgent(TestProxy{run: start, blockChannel: blockChan}, -10*time.Second)
 	go func() { _ = a.Run(ctx) }()
 	a.Restart(startConfig)
 	<-blockChan
@@ -165,6 +168,60 @@ func TestWaitForLive(t *testing.T) {
 	g.Expect(epoch1StartTime).Should(BeTemporally("~", expectedEpoch1StartTime, errThreshold))
 }
 
+func TestExitDuringWaitForLive(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	epoch0Exit := make(chan error)
+	epoch1Started := make(chan struct{}, 1)
+	start := func(config interface{}, epoch int, _ <-chan error) error {
+		switch epoch {
+		case 0:
+			// The first epoch just waits for the exit error.
+			return <-epoch0Exit
+		case 1:
+			// Indicate that the second epoch was started.
+			close(epoch1Started)
+		}
+		<-ctx.Done()
+		return nil
+	}
+	neverLive := func() bool {
+		// Never go live.
+		return false
+	}
+	a := NewAgent(TestProxy{run: start, live: neverLive}, -10*time.Second)
+	go func() { _ = a.Run(ctx) }()
+
+	// Start the first epoch.
+	a.Restart("config1")
+
+	// Immediately start the second epoch. This will block until the first one exits, since it will never go live.
+	go a.Restart("config2")
+
+	// Trigger the first epoch to exit
+	var epoch1StartTime time.Time
+	expectedEpoch1StartTime := time.Now()
+	epoch0Exit <- errors.New("fake")
+
+	select {
+	case <-epoch1Started:
+		// Started
+		epoch1StartTime = time.Now()
+		break
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for epoch 1 to start")
+	}
+
+	// An error threshold used for the time comparison. Should (hopefully) be enough to avoid flakes.
+	errThreshold := 1 * time.Second
+
+	// Verify that the second epoch is delayed until epoch 0 was live.
+	g.Expect(epoch1StartTime).Should(BeTemporally("~", expectedEpoch1StartTime, errThreshold))
+}
+
 // TestApplyTwice tests that scheduling the same config does not trigger a restart
 func TestApplyTwice(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -202,9 +259,6 @@ func TestStartTwiceStop(t *testing.T) {
 		} else if config == desired2 && epoch == 2 {
 			close(stop1)
 			<-ctx.Done()
-		} else if _, ok := config.(DrainConfig); !ok { // don't need to validate draining proxy here
-			t.Errorf("Unexpected start %v, epoch %d", config, epoch)
-			cancel()
 		}
 		return nil
 	}

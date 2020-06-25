@@ -39,8 +39,35 @@ fi
 if [ "x${ISTIO_VERSION}" = "x" ] ; then
   ISTIO_VERSION=$(curl -L -s https://api.github.com/repos/istio/istio/releases | \
                   grep tag_name | sed "s/ *\"tag_name\": *\"\\(.*\\)\",*/\\1/" | \
-                  grep -v "rc\.[0-9]$" | sort -t"." -k 1,1 -k 2,2 -k 3,3 -k 4,4 | tail -n 1)
+		  grep -v -E "(alpha|beta|rc)\.[0-9]$" | sort -t"." -k 1,1 -k 2,2 -k 3,3 -k 4,4 | tail -n 1)
 fi
+
+LOCAL_ARCH=$(uname -m)
+if [ "${TARGET_ARCH}" ]; then
+    LOCAL_ARCH=${TARGET_ARCH}
+fi
+
+case "${LOCAL_ARCH}" in 
+  x86_64)
+    ISTIO_ARCH=amd64
+    ;;
+  armv8*)
+    ISTIO_ARCH=arm64
+    ;;
+  aarch64*)
+    ISTIO_ARCH=arm64
+    ;;
+  armv*)
+    ISTIO_ARCH=armv7
+    ;;
+  amd64|arm64)
+    ISTIO_ARCH=${LOCAL_ARCH}
+    ;;
+  *)
+    echo "This system's architecture, ${LOCAL_ARCH}, isn't supported"
+    exit 1
+    ;;
+esac
 
 if [ "x${ISTIO_VERSION}" = "x" ] ; then
   printf "Unable to get latest Istio version. Set ISTIO_VERSION env var and re-run. For example: export ISTIO_VERSION=1.0.4"
@@ -49,10 +76,31 @@ fi
 
 NAME="istio-$ISTIO_VERSION"
 URL="https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istio-${ISTIO_VERSION}-${OSEXT}.tar.gz"
+ARCH_URL="https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istio-${ISTIO_VERSION}-${OSEXT}-${ISTIO_ARCH}.tar.gz"
+
 printf "Downloading %s from %s ..." "$NAME" "$URL"
-curl -L "$URL" | tar xz
+if ! curl -fsLO "$URL"
+then
+  printf "Failed.\n\nTrying with TARGET_ARCH. Downloading %s from %s ...\n" "$NAME" "$ARCH_URL"
+  if ! curl -fsLO "$ARCH_URL"
+  then
+    printf "\n\n"
+    printf "Unable to download Istio %s at this moment!\n" "$ISTIO_VERSION"
+    printf "Please verify the version you are trying to download.\n\n"
+    exit
+  else
+    filename="istio-${ISTIO_VERSION}-${OSEXT}-${ISTIO_ARCH}.tar.gz"
+    tar -xzf "${filename}"
+    rm "${filename}"
+  fi
+else
+  filename="istio-${ISTIO_VERSION}-${OSEXT}.tar.gz"
+  tar -xzf "${filename}"
+  rm "${filename}"
+fi
+
 printf ""
-printf "Istio %s Download Complete!\n" "$ISTIO_VERSION"
+printf "\nIstio %s Download Complete!\n" "$ISTIO_VERSION"
 printf "\n"
 printf "Istio has been successfully downloaded into the %s folder on your system.\n" "$NAME"
 printf "\n"

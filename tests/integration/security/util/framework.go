@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,28 @@ package util
 import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/components/galley"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/components/pilot"
 )
 
-func EchoConfig(name string, ns namespace.Instance, headless bool, annos echo.Annotations, g galley.Instance, p pilot.Instance) echo.Config {
-	return echo.Config{
+func EchoConfig(name string, ns namespace.Instance, headless bool, annos echo.Annotations, p pilot.Instance) echo.Config {
+	out := echo.Config{
 		Service:        name,
 		Namespace:      ns,
 		ServiceAccount: true,
 		Headless:       headless,
-		Annotations:    annos,
+		Subsets: []echo.SubsetConfig{
+			{
+				Version:     "v1",
+				Annotations: annos,
+			},
+		},
 		Ports: []echo.Port{
 			{
 				Name:     "http",
 				Protocol: protocol.HTTP,
+				// We use a port > 1024 to not require root
+				InstancePort: 8090,
 			},
 			{
 				Name:     "tcp",
@@ -43,7 +49,13 @@ func EchoConfig(name string, ns namespace.Instance, headless bool, annos echo.An
 				Protocol: protocol.GRPC,
 			},
 		},
-		Galley: g,
-		Pilot:  p,
+		Pilot: p,
 	}
+
+	// for headless service with selector, the port and target port must be equal
+	// Ref: https://kubernetes.io/docs/concepts/services-networking/service/#headless-services
+	if headless {
+		out.Ports[0].ServicePort = 8090
+	}
+	return out
 }

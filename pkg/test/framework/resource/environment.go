@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,30 @@ package resource
 import (
 	"fmt"
 
-	"istio.io/istio/pkg/test/framework/components/environment"
+	"istio.io/istio/pkg/test/framework/resource/environment"
 )
+
+// EnvironmentFactory creates an Environment.
+type EnvironmentFactory func(ctx Context) (Environment, error)
+
+var _ EnvironmentFactory = NilEnvironmentFactory
+
+// NilEnvironmentFactory is an EnvironmentFactory that returns nil.
+func NilEnvironmentFactory(Context) (Environment, error) {
+	return nil, nil
+}
 
 // Environment is the ambient environment that the test runs in.
 type Environment interface {
 	Resource
 
 	EnvironmentName() environment.Name
+
+	// IsMulticluster is a utility method that indicates whether there are multiple Clusters available.
+	IsMulticluster() bool
+
+	// Clusters in this Environment. There will always be at least one.
+	Clusters() []Cluster
 
 	// Case calls the given function if this environment has the given name.
 	Case(e environment.Name, fn func())

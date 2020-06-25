@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,25 +17,35 @@ package model
 import (
 	"sync"
 
-	auth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	envoy_config_grpc_credential_v2alpha "github.com/envoyproxy/go-control-plane/envoy/config/grpc_credential/v2alpha"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoy_config_grpc_credential "github.com/envoyproxy/go-control-plane/envoy/config/grpc_credential/v3"
+	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/any"
 
+	networking "istio.io/api/networking/v1alpha3"
+
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/istio/pkg/config/constants"
 )
 
 const (
 	// SDSStatPrefix is the human readable prefix to use when emitting statistics for the SDS service.
 	SDSStatPrefix = "sdsstat"
 
+	// SDSClusterName is the name of the cluster for SDS connections
+	SDSClusterName = "sds-grpc"
+
 	// SDSDefaultResourceName is the default name in sdsconfig, used for fetching normal key/cert.
 	SDSDefaultResourceName = "default"
 
 	// SDSRootResourceName is the sdsconfig name for root CA, used for fetching root cert.
 	SDSRootResourceName = "ROOTCA"
+
+	// K8sSAJwtFileName is the token volume mount file name for k8s jwt token.
+	K8sSAJwtFileName = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 	// K8sSATrustworthyJwtFileName is the token volume mount file name for k8s trustworthy jwt token.
 	K8sSATrustworthyJwtFileName = "/var/run/secrets/tokens/istio-token"
@@ -48,15 +58,10 @@ const (
 	K8sSAJwtTokenHeaderKey = "istio_sds_credentials_header-bin"
 
 	// IngressGatewaySdsUdsPath is the UDS path for ingress gateway to get credentials via SDS.
-	IngressGatewaySdsUdsPath = "unix:/var/run/ingress_gateway/sds"
+	IngressGatewaySdsUdsPath = "unix:./var/run/ingress_gateway/sds"
 
-	// IngressGatewaySdsCaSuffix is the suffix of the sds resource name for root CA.
-	IngressGatewaySdsCaSuffix = "-cacert"
-
-	// IstioJwtFilterName is the name for the Istio Jwt filter. This should be the same
-	// as the name defined in
-	// https://github.com/istio/proxy/blob/master/src/envoy/http/jwt_auth/http_filter_factory.cc#L50
-	IstioJwtFilterName = "jwt-auth"
+	// SdsCaSuffix is the suffix of the sds resource name for root CA.
+	SdsCaSuffix = "-cacert"
 
 	// EnvoyJwtFilterName is the name of the Envoy JWT filter. This should be the same as the name defined
 	// in https://github.com/envoyproxy/envoy/blob/v1.9.1/source/extensions/filters/http/well_known_names.h#L48
@@ -68,37 +73,8 @@ const (
 	AuthnFilterName = "istio_authn"
 )
 
-// MutualTLSMode is the mutule TLS mode specified by authentication policy.
-type MutualTLSMode int
-
-const (
-	// MTLSUnknown is used to indicate the variable hasn't been initialized correctly (with the authentication policy).
-	MTLSUnknown MutualTLSMode = iota
-
-	// MTLSDisable if authentication policy disable mTLS.
-	MTLSDisable
-
-	// MTLSPermissive if authentication policy enable mTLS in permissive mode.
-	MTLSPermissive
-
-	// MTLSStrict if authentication policy enable mTLS in strict mode.
-	MTLSStrict
-)
-
-// String converts MutualTLSMode to human readable string for debugging.
-func (mode MutualTLSMode) String() string {
-	// declare an array of strings
-	names := [...]string{
-		"UNKNOWN",
-		"DISABLE",
-		"PERMISSIVE",
-		"STRICT"}
-
-	return names[mode]
-}
-
-// ConstructSdsSecretConfigForGatewayListener constructs SDS secret configuration for ingress gateway.
-func ConstructSdsSecretConfigForGatewayListener(name, sdsUdsPath string) *auth.SdsSecretConfig {
+// ConstructSdsSecretConfigWithCustomUds constructs SDS secret configuration for ingress gateway.
+func ConstructSdsSecretConfigWithCustomUds(name, sdsUdsPath string) *tls.SdsSecretConfig {
 	if name == "" || sdsUdsPath == "" {
 		return nil
 	}
@@ -108,7 +84,7 @@ func ConstructSdsSecretConfigForGatewayListener(name, sdsUdsPath string) *auth.S
 		StatPrefix: SDSStatPrefix,
 	}
 
-	return &auth.SdsSecretConfig{
+	return &tls.SdsSecretConfig{
 		Name: name,
 		SdsConfig: &core.ConfigSource{
 			ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
@@ -128,36 +104,13 @@ func ConstructSdsSecretConfigForGatewayListener(name, sdsUdsPath string) *auth.S
 	}
 }
 
-// ConstructSdsSecretConfig constructs SDS Sececret Configuration for workload proxy.
-func ConstructSdsSecretConfig(name, sdsUdsPath string, metadata *model.NodeMetadata) *auth.SdsSecretConfig {
+// ConstructSdsSecretConfig constructs SDS Secret Configuration for workload proxy.
+func ConstructSdsSecretConfig(name, sdsUdsPath string) *tls.SdsSecretConfig {
 	if name == "" || sdsUdsPath == "" {
 		return nil
 	}
 
-	gRPCConfig := &core.GrpcService_GoogleGrpc{
-		TargetUri:  sdsUdsPath,
-		StatPrefix: SDSStatPrefix,
-		ChannelCredentials: &core.GrpcService_GoogleGrpc_ChannelCredentials{
-			CredentialSpecifier: &core.GrpcService_GoogleGrpc_ChannelCredentials_LocalCredentials{
-				LocalCredentials: &core.GrpcService_GoogleGrpc_GoogleLocalCredentials{},
-			},
-		},
-	}
-
-	// If metadata.SdsTokenPath is non-empty, envoy will fetch tokens from metadata.SdsTokenPath.
-	// Otherwise, if useK8sSATrustworthyJwt is set, envoy will fetch and pass k8s sa trustworthy jwt(which is available for k8s 1.12 or higher),
-	// pass it to SDS server to request key/cert.
-	if sdsTokenPath := metadata.SdsTokenPath; len(sdsTokenPath) > 0 {
-		log.Debugf("SDS token path is (%v)", sdsTokenPath)
-		gRPCConfig.CredentialsFactoryName = FileBasedMetadataPlugName
-		gRPCConfig.CallCredentials = ConstructgRPCCallCredentials(sdsTokenPath, K8sSAJwtTokenHeaderKey)
-	} else {
-		// Use the default token path.
-		gRPCConfig.CredentialsFactoryName = FileBasedMetadataPlugName
-		gRPCConfig.CallCredentials = ConstructgRPCCallCredentials(K8sSATrustworthyJwtFileName, K8sSAJwtTokenHeaderKey)
-	}
-
-	return &auth.SdsSecretConfig{
+	return &tls.SdsSecretConfig{
 		Name: name,
 		SdsConfig: &core.ConfigSource{
 			ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
@@ -165,8 +118,8 @@ func ConstructSdsSecretConfig(name, sdsUdsPath string, metadata *model.NodeMetad
 					ApiType: core.ApiConfigSource_GRPC,
 					GrpcServices: []*core.GrpcService{
 						{
-							TargetSpecifier: &core.GrpcService_GoogleGrpc_{
-								GoogleGrpc: gRPCConfig,
+							TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+								EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
 							},
 						},
 					},
@@ -178,9 +131,9 @@ func ConstructSdsSecretConfig(name, sdsUdsPath string, metadata *model.NodeMetad
 }
 
 // ConstructValidationContext constructs ValidationContext in CommonTLSContext.
-func ConstructValidationContext(rootCAFilePath string, subjectAltNames []string) *auth.CommonTlsContext_ValidationContext {
-	ret := &auth.CommonTlsContext_ValidationContext{
-		ValidationContext: &auth.CertificateValidationContext{
+func ConstructValidationContext(rootCAFilePath string, subjectAltNames []string) *tls.CommonTlsContext_ValidationContext {
+	ret := &tls.CommonTlsContext_ValidationContext{
+		ValidationContext: &tls.CertificateValidationContext{
 			TrustedCa: &core.DataSource{
 				Specifier: &core.DataSource_Filename{
 					Filename: rootCAFilePath,
@@ -190,16 +143,99 @@ func ConstructValidationContext(rootCAFilePath string, subjectAltNames []string)
 	}
 
 	if len(subjectAltNames) > 0 {
-		ret.ValidationContext.VerifySubjectAltName = subjectAltNames
+		ret.ValidationContext.MatchSubjectAltNames = util.StringToExactMatch(subjectAltNames)
 	}
 
 	return ret
 }
 
+// ApplyToCommonTLSContext completes the commonTlsContext for `ISTIO_MUTUAL` TLS mode
+func ApplyToCommonTLSContext(tlsContext *tls.CommonTlsContext, metadata *model.NodeMetadata, sdsPath string, subjectAltNames []string) {
+	// configure TLS with SDS
+	if metadata.SdsEnabled && sdsPath != "" {
+		// These are certs being mounted from within the pod. Rather than reading directly in Envoy,
+		// which does not support rotation, we will serve them over SDS by reading the files.
+		// We should check if these certs have values, if yes we should use them or otherwise fall back to defaults.
+		res := model.SdsCertificateConfig{
+			CertificatePath:   metadata.TLSServerCertChain,
+			PrivateKeyPath:    metadata.TLSServerKey,
+			CaCertificatePath: metadata.TLSServerRootCert,
+		}
+
+		// configure server listeners with SDS.
+		tlsContext.ValidationContextType = &tls.CommonTlsContext_CombinedValidationContext{
+			CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
+				DefaultValidationContext: &tls.CertificateValidationContext{MatchSubjectAltNames: util.StringToExactMatch(subjectAltNames)},
+				ValidationContextSdsSecretConfig: ConstructSdsSecretConfig(
+					model.GetOrDefault(res.GetRootResourceName(), SDSRootResourceName), sdsPath),
+			},
+		}
+		tlsContext.TlsCertificateSdsSecretConfigs = []*tls.SdsSecretConfig{
+			ConstructSdsSecretConfig(model.GetOrDefault(res.GetResourceName(), SDSDefaultResourceName), sdsPath),
+		}
+	} else {
+		// TODO(ramaraochavali): Clean this codepath later as we default to SDS.
+		// SDS disabled, fall back on using mounted certificates
+		base := metadata.CertBaseDir + constants.AuthCertsPath
+		tlsServerRootCert := model.GetOrDefault(metadata.TLSServerRootCert, base+constants.RootCertFilename)
+
+		tlsContext.ValidationContextType = ConstructValidationContext(tlsServerRootCert, subjectAltNames)
+
+		tlsServerCertChain := model.GetOrDefault(metadata.TLSServerCertChain, base+constants.CertChainFilename)
+		tlsServerKey := model.GetOrDefault(metadata.TLSServerKey, base+constants.KeyFilename)
+
+		tlsContext.TlsCertificates = []*tls.TlsCertificate{
+			{
+				CertificateChain: &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: tlsServerCertChain,
+					},
+				},
+				PrivateKey: &core.DataSource{
+					Specifier: &core.DataSource_Filename{
+						Filename: tlsServerKey,
+					},
+				},
+			},
+		}
+	}
+}
+
+// ApplyCustomSDSToCommonTLSContext applies the customized sds to CommonTlsContext
+// Used for building both gateway/sidecar TLS context
+func ApplyCustomSDSToCommonTLSContext(tlsContext *tls.CommonTlsContext, tlsOpts *networking.ServerTLSSettings, sdsUdsPath string) {
+	// create SDS config for gateway/sidecar to fetch key/cert from agent.
+	tlsContext.TlsCertificateSdsSecretConfigs = []*tls.SdsSecretConfig{
+		ConstructSdsSecretConfigWithCustomUds(tlsOpts.CredentialName, sdsUdsPath),
+	}
+	// If tls mode is MUTUAL, create SDS config for gateway/sidecar to fetch certificate validation context
+	// at gateway agent. Otherwise, use the static certificate validation context config.
+	if tlsOpts.Mode == networking.ServerTLSSettings_MUTUAL {
+		defaultValidationContext := &tls.CertificateValidationContext{
+			MatchSubjectAltNames:  util.StringToExactMatch(tlsOpts.SubjectAltNames),
+			VerifyCertificateSpki: tlsOpts.VerifyCertificateSpki,
+			VerifyCertificateHash: tlsOpts.VerifyCertificateHash,
+		}
+		tlsContext.ValidationContextType = &tls.CommonTlsContext_CombinedValidationContext{
+			CombinedValidationContext: &tls.CommonTlsContext_CombinedCertificateValidationContext{
+				DefaultValidationContext: defaultValidationContext,
+				ValidationContextSdsSecretConfig: ConstructSdsSecretConfigWithCustomUds(
+					tlsOpts.CredentialName+SdsCaSuffix, sdsUdsPath),
+			},
+		}
+	} else if len(tlsOpts.SubjectAltNames) > 0 {
+		tlsContext.ValidationContextType = &tls.CommonTlsContext_ValidationContext{
+			ValidationContext: &tls.CertificateValidationContext{
+				MatchSubjectAltNames: util.StringToExactMatch(tlsOpts.SubjectAltNames),
+			},
+		}
+	}
+}
+
 // ConstructgRPCCallCredentials is used to construct SDS config which is only available from 1.1
 func ConstructgRPCCallCredentials(tokenFileName, headerKey string) []*core.GrpcService_GoogleGrpc_CallCredentials {
 	// If k8s sa jwt token file exists, envoy only handles plugin credentials.
-	config := &envoy_config_grpc_credential_v2alpha.FileBasedMetadataConfig{
+	config := &envoy_config_grpc_credential.FileBasedMetadataConfig{
 		SecretData: &core.DataSource{
 			Specifier: &core.DataSource_Filename{
 				Filename: tokenFileName,
@@ -239,7 +275,7 @@ var fileBasedMetadataConfigAnyMap sync.Map
 // returns different result. Once SDS config differs, Envoy will create multiple SDS clients to fetch
 // same SDS resource. To solve this problem, we use findOrMarshalFileBasedMetadataConfig so that
 // FileBasedMetadataConfig is marshaled once, and is reused in all SDS configs.
-func findOrMarshalFileBasedMetadataConfig(tokenFileName, headerKey string, fbMetadata *envoy_config_grpc_credential_v2alpha.FileBasedMetadataConfig) *any.Any {
+func findOrMarshalFileBasedMetadataConfig(tokenFileName, headerKey string, fbMetadata *envoy_config_grpc_credential.FileBasedMetadataConfig) *any.Any {
 	key := fbMetadataAnyKey{
 		tokenFileName: tokenFileName,
 		headerKey:     headerKey,

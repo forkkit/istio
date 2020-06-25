@@ -1,6 +1,6 @@
 #!/usr/bin/ruby
 #
-# Copyright 2017 Istio Authors
+# Copyright Istio Authors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ end
 
 port = Integer(ARGV[0])
 
-server = WEBrick::HTTPServer.new :BindAddress => '0.0.0.0', :Port => port
+server = WEBrick::HTTPServer.new :BindAddress => '*', :Port => port
 
 trap 'INT' do server.shutdown end
 

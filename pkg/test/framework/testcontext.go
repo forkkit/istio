@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,13 +20,15 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"istio.io/istio/pkg/test"
-	"istio.io/istio/pkg/test/framework/components/environment"
-	"istio.io/istio/pkg/test/framework/core"
+	"istio.io/istio/pkg/test/framework/errors"
 	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
+	"istio.io/istio/pkg/test/framework/resource/environment"
 	"istio.io/istio/pkg/test/scopes"
 )
 
@@ -55,6 +57,7 @@ type TestContext interface {
 	RequireOrSkip(envName environment.Name)
 
 	// WhenDone runs the given function when the test context completes.
+	// This function may not (safely) access the test context.
 	WhenDone(fn func() error)
 
 	// Done should be called when this context is no longer needed. It triggers the asynchronous cleanup of any
@@ -98,7 +101,48 @@ type testContext struct {
 	workDir string
 }
 
+// Before executing a new context, we should wait for existing contexts to terminate if they are NOT parents of this context.
+// This is to workaround termination of functions run with RunParallel. When this is used, child tests will not run until the parent
+// has terminated. This means that the parent cannot synchronously cleanup, or it would block its children. However, if we do async cleanup,
+// then new tests can unexpectedly start during the cleanup of another. This may lead to odd results, like a test cleanup undoing the setup of a future test.
+// To workaround this, we maintain a set of all contexts currently terminating. Before starting the context, we will search this set;
+// if any non-parent contexts are found, we will wait.
+func waitForParents(test *Test) {
+	iterations := 0
+	for {
+		iterations++
+		done := true
+		globalParentLock.Range(func(key, value interface{}) bool {
+			k := key.(*Test)
+			current := test
+			for current != nil {
+				if current == k {
+					return true
+				}
+				current = current.parent
+
+			}
+			// We found an item in the list, and we are *not* a child of it. This means another test hierarchy has exclusive access right now
+			// Wait until they are finished before proceeding
+			done = false
+			return true
+		})
+		if done {
+			return
+		}
+		time.Sleep(time.Millisecond * 50)
+		// Add some logging in case something locks up so we can debug
+		if iterations%10 == 0 {
+			globalParentLock.Range(func(key, value interface{}) bool {
+				scopes.Framework.Warnf("Stuck waiting for parent test suites to terminate... %v is blocking", key.(*Test).goTest.Name())
+				return true
+			})
+		}
+	}
+}
+
 func newTestContext(test *Test, goTest *testing.T, s *suiteContext, parentScope *scope, labels label.Set) *testContext {
+	waitForParents(test)
 	id := s.allocateContextID(goTest.Name())
 
 	allLabels := s.suiteLabels.Merge(labels)
@@ -129,7 +173,7 @@ func newTestContext(test *Test, goTest *testing.T, s *suiteContext, parentScope 
 	}
 }
 
-func (c *testContext) Settings() *core.Settings {
+func (c *testContext) Settings() *resource.Settings {
 	return c.suite.settings
 }
 
@@ -138,6 +182,13 @@ func (c *testContext) TrackResource(r resource.Resource) resource.ID {
 	rid := &resourceID{id: id}
 	c.scope.add(r, rid)
 	return rid
+}
+
+func (c *testContext) GetResource(ref interface{}) error {
+	if err := c.scope.get(ref); err != nil {
+		return c.suite.GetResource(ref)
+	}
+	return nil
 }
 
 func (c *testContext) WorkDir() string {
@@ -149,12 +200,13 @@ func (c *testContext) Environment() resource.Environment {
 }
 
 func (c *testContext) CreateDirectory(name string) (string, error) {
-	dir, err := ioutil.TempDir(c.workDir, name)
+	dir := filepath.Join(c.workDir, name)
+	err := os.Mkdir(dir, os.ModePerm)
 	if err != nil {
-		scopes.Framework.Errorf("Error creating temp dir: runID='%v', prefix='%s', workDir='%v', err='%v'",
+		scopes.Framework.Errorf("Error creating dir: runID='%v', prefix='%s', workDir='%v', err='%v'",
 			c.suite.settings.RunID, name, c.workDir, err)
 	} else {
-		scopes.Framework.Debugf("Created a temp dir: runID='%v', name='%s'", c.suite.settings.RunID, dir)
+		scopes.Framework.Debugf("Created a dir: runID='%v', name='%s'", c.suite.settings.RunID, dir)
 	}
 	return dir, err
 }
@@ -177,6 +229,54 @@ func (c *testContext) CreateTmpDirectory(prefix string) (string, error) {
 	}
 
 	return dir, err
+}
+
+func (c *testContext) ApplyConfig(ns string, yamlText ...string) error {
+	for _, cc := range c.Environment().Clusters() {
+		if err := cc.ApplyConfig(ns, yamlText...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *testContext) ApplyConfigOrFail(t test.Failer, ns string, yamlText ...string) {
+	for _, cc := range c.Environment().Clusters() {
+		cc.ApplyConfigOrFail(t, ns, yamlText...)
+	}
+}
+
+func (c *testContext) DeleteConfig(ns string, yamlText ...string) error {
+	for _, cc := range c.Environment().Clusters() {
+		if err := cc.DeleteConfig(ns, yamlText...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *testContext) DeleteConfigOrFail(t test.Failer, ns string, yamlText ...string) {
+	for _, cc := range c.Environment().Clusters() {
+		cc.DeleteConfigOrFail(t, ns, yamlText...)
+	}
+}
+
+func (c *testContext) ApplyConfigDir(ns string, configDir string) error {
+	for _, cc := range c.Environment().Clusters() {
+		if err := cc.ApplyConfigDir(ns, configDir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *testContext) DeleteConfigDir(ns string, configDir string) error {
+	for _, cc := range c.Environment().Clusters() {
+		if err := cc.DeleteConfigDir(ns, configDir); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *testContext) CreateTmpDirectoryOrFail(prefix string) string {
@@ -207,9 +307,10 @@ func (c *testContext) NewSubTest(name string) *Test {
 	}
 
 	return &Test{
-		name:   name,
-		parent: c.test,
-		s:      c.test.s,
+		name:          name,
+		parent:        c.test,
+		s:             c.test.s,
+		featureLabels: c.test.featureLabels,
 	}
 }
 
@@ -227,6 +328,11 @@ func (c *testContext) Done() {
 	scopes.Framework.Debugf("Begin cleaning up testContext: %q", c.id)
 	if err := c.scope.done(c.suite.settings.NoCleanup); err != nil {
 		c.Logf("error scope cleanup: %v", err)
+		if c.Settings().FailOnDeprecation {
+			if errors.IsOrContainsDeprecatedError(err) {
+				c.Error("Using deprecated Envoy features. Failing due to -istio.test.deprecation_failure flag.")
+			}
+		}
 	}
 	scopes.Framework.Debugf("Completed cleaning up testContext: %q", c.id)
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package monitor_test
+package monitor
 
 import (
 	"errors"
@@ -24,19 +24,17 @@ import (
 	networking "istio.io/api/networking/v1alpha3"
 
 	"istio.io/istio/pilot/pkg/config/memory"
-	"istio.io/istio/pilot/pkg/config/monitor"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/schema"
-	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/gvk"
 )
-
-const checkInterval = 100 * time.Millisecond
 
 var createConfigSet = []*model.Config{
 	{
 		ConfigMeta: model.ConfigMeta{
-			Name: "magic",
-			Type: "gateway",
+			Name:             "magic",
+			GroupVersionKind: gvk.Gateway,
 		},
 		Spec: &networking.Gateway{
 			Servers: []*networking.Server{
@@ -56,8 +54,8 @@ var createConfigSet = []*model.Config{
 var updateConfigSet = []*model.Config{
 	{
 		ConfigMeta: model.ConfigMeta{
-			Name: "magic",
-			Type: "gateway",
+			Name:             "magic",
+			GroupVersionKind: gvk.Gateway,
 		},
 		Spec: &networking.Gateway{
 			Servers: []*networking.Server{
@@ -77,9 +75,7 @@ var updateConfigSet = []*model.Config{
 func TestMonitorForChange(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	configDescriptor := schema.Set{schemas.Gateway}
-
-	store := memory.Make(configDescriptor)
+	store := memory.Make(collection.SchemasFor(collections.IstioNetworkingV1Alpha3Gateways))
 
 	var (
 		callCount int
@@ -94,20 +90,26 @@ func TestMonitorForChange(t *testing.T) {
 			err = nil
 		case 3:
 			configs = updateConfigSet
-		case 8:
+		case 6:
 			configs = []*model.Config{}
 		}
 
 		callCount++
 		return configs, err
 	}
-	mon := monitor.NewMonitor("", store, checkInterval, someConfigFunc)
+	mon := NewMonitor("", store, someConfigFunc, "")
 	stop := make(chan struct{})
 	defer func() { stop <- struct{}{} }() // shut it down
 	mon.Start(stop)
 
+	go func() {
+		for i := 0; i < 10; i++ {
+			mon.updateCh <- struct{}{}
+			time.Sleep(time.Millisecond * 100)
+		}
+	}()
 	g.Eventually(func() error {
-		c, err := store.List("gateway", "")
+		c, err := store.List(gvk.Gateway, "")
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 
 		if len(c) != 1 {
@@ -122,8 +124,11 @@ func TestMonitorForChange(t *testing.T) {
 	}).Should(gomega.Succeed())
 
 	g.Eventually(func() error {
-		c, err := store.List("gateway", "")
+		c, err := store.List(gvk.Gateway, "")
 		g.Expect(err).NotTo(gomega.HaveOccurred())
+		if len(c) == 0 {
+			return errors.New("no config")
+		}
 
 		gateway := c[0].Spec.(*networking.Gateway)
 		if gateway.Servers[0].Port.Protocol != "HTTP2" {
@@ -134,7 +139,7 @@ func TestMonitorForChange(t *testing.T) {
 	}).Should(gomega.Succeed())
 
 	g.Eventually(func() ([]model.Config, error) {
-		return store.List("gateway", "")
+		return store.List(gvk.Gateway, "")
 	}).Should(gomega.HaveLen(0))
 
 }
@@ -142,9 +147,7 @@ func TestMonitorForChange(t *testing.T) {
 func TestMonitorForError(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	configDescriptor := schema.Set{schemas.Gateway}
-
-	store := memory.Make(configDescriptor)
+	store := memory.Make(collection.SchemasFor(collections.IstioNetworkingV1Alpha3Gateways))
 
 	var (
 		callCount int
@@ -168,16 +171,22 @@ func TestMonitorForError(t *testing.T) {
 		callCount++
 		return configs, err
 	}
-	mon := monitor.NewMonitor("", store, checkInterval, someConfigFunc)
+	mon := NewMonitor("", store, someConfigFunc, "")
 	stop := make(chan struct{})
 	defer func() { stop <- struct{}{} }() // shut it down
 	mon.Start(stop)
 
+	go func() {
+		for i := 0; i < 10; i++ {
+			mon.updateCh <- struct{}{}
+			time.Sleep(time.Millisecond * 10)
+		}
+	}()
 	//Test ensures that after a coplilot connection error the data remains
 	//nil data return and error return keeps the existing data aka createConfigSet
 	<-delay
 	g.Eventually(func() error {
-		c, err := store.List("gateway", "")
+		c, err := store.List(gvk.Gateway, "")
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 
 		if len(c) != 1 {

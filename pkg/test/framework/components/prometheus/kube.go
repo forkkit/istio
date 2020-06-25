@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,13 +18,18 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"path/filepath"
+	"strings"
 	"time"
 
 	prometheusApi "github.com/prometheus/client_golang/api"
 	prometheusApiV1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
+	kubeApiMeta "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/framework/components/environment/kube"
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/resource"
@@ -41,7 +46,7 @@ const (
 
 var (
 	retryTimeout = retry.Timeout(time.Second * 120)
-	retryDelay   = retry.Delay(time.Second * 20)
+	retryDelay   = retry.Delay(time.Second * 5)
 
 	_ Instance  = &kubeComponent{}
 	_ io.Closer = &kubeComponent{}
@@ -52,36 +57,72 @@ type kubeComponent struct {
 
 	api       prometheusApiV1.API
 	forwarder testKube.PortForwarder
-	env       *kube.Environment
+	cluster   kube.Cluster
+	cleanup   func() error
 }
 
-func newKube(ctx resource.Context) (Instance, error) {
-	env := ctx.Environment().(*kube.Environment)
+func getPrometheusYaml() (string, error) {
+	yamlBytes, err := ioutil.ReadFile(filepath.Join(env.IstioSrc, "samples/addons/prometheus.yaml"))
+	if err != nil {
+		return "", err
+	}
+	yaml := string(yamlBytes)
+	// For faster tests, drop scrape interval
+	yaml = strings.ReplaceAll(yaml, "scrape_interval: 15s", "scrape_interval: 5s")
+	yaml = strings.ReplaceAll(yaml, "scrape_timeout: 10s", "scrape_timeout: 5s")
+	return yaml, nil
+}
+
+func installPrometheus(ctx resource.Context, ns string) error {
+	yaml, err := getPrometheusYaml()
+	if err != nil {
+		return err
+	}
+	return ctx.ApplyConfig(ns, yaml)
+}
+
+func removePrometheus(ctx resource.Context, ns string) error {
+	yaml, err := getPrometheusYaml()
+	if err != nil {
+		return err
+	}
+	return ctx.DeleteConfig(ns, yaml)
+}
+
+func newKube(ctx resource.Context, cfgIn Config) (Instance, error) {
 	c := &kubeComponent{
-		env: env,
+		cluster: kube.ClusterOrDefault(cfgIn.Cluster, ctx.Environment()),
 	}
 	c.id = ctx.TrackResource(c)
-
 	// Find the Prometheus pod and service, and start forwarding a local port.
 	cfg, err := istio.DefaultConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	fetchFn := env.Accessor.NewSinglePodFetch(cfg.TelemetryNamespace, fmt.Sprintf("app=%s", appName))
-	pods, err := env.Accessor.WaitUntilPodsAreReady(fetchFn)
+	if !cfgIn.SkipDeploy {
+		if err := installPrometheus(ctx, cfg.TelemetryNamespace); err != nil {
+			return nil, err
+		}
+
+		c.cleanup = func() error {
+			return removePrometheus(ctx, cfg.TelemetryNamespace)
+		}
+	}
+	fetchFn := testKube.NewSinglePodFetch(c.cluster.Accessor, cfg.TelemetryNamespace, fmt.Sprintf("app=%s", appName))
+	pods, err := c.cluster.WaitUntilPodsAreReady(fetchFn)
 	if err != nil {
 		return nil, err
 	}
 	pod := pods[0]
 
-	svc, err := env.Accessor.GetService(cfg.TelemetryNamespace, serviceName)
+	svc, err := c.cluster.CoreV1().Services(cfg.TelemetryNamespace).Get(context.TODO(), serviceName, kubeApiMeta.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 	port := uint16(svc.Spec.Ports[0].Port)
 
-	forwarder, err := env.Accessor.NewPortForwarder(pod, 0, port)
+	forwarder, err := c.cluster.NewPortForwarder(pod, 0, port)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +157,7 @@ func (c *kubeComponent) API() prometheusApiV1.API {
 func (c *kubeComponent) WaitForQuiesce(format string, args ...interface{}) (model.Value, error) {
 	var previous model.Value
 
-	time.Sleep(time.Second * 5)
+	time.Sleep(time.Second * 1)
 
 	value, err := retry.Do(func() (interface{}, bool, error) {
 
@@ -127,7 +168,7 @@ func (c *kubeComponent) WaitForQuiesce(format string, args ...interface{}) (mode
 
 		scopes.Framework.Debugf("WaitForQuiesce running: %q", query)
 
-		v, err := c.api.Query(context.Background(), query, time.Now())
+		v, _, err := c.api.Query(context.Background(), query, time.Now())
 		if err != nil {
 			return nil, false, fmt.Errorf("error querying Prometheus: %v", err)
 		}
@@ -162,11 +203,9 @@ func (c *kubeComponent) WaitForQuiesceOrFail(t test.Failer, format string, args 
 	return v
 }
 
-func (c *kubeComponent) WaitForOneOrMore(format string, args ...interface{}) error {
+func (c *kubeComponent) WaitForOneOrMore(format string, args ...interface{}) (model.Value, error) {
 
-	time.Sleep(time.Second * 5)
-
-	_, err := retry.Do(func() (interface{}, bool, error) {
+	value, err := retry.Do(func() (interface{}, bool, error) {
 		query, err := tmpl.Evaluate(fmt.Sprintf(format, args...), map[string]string{})
 		if err != nil {
 			return nil, true, err
@@ -174,7 +213,7 @@ func (c *kubeComponent) WaitForOneOrMore(format string, args ...interface{}) err
 
 		scopes.Framework.Debugf("WaitForOneOrMore running: %q", query)
 
-		v, err := c.api.Query(context.Background(), query, time.Now())
+		v, _, err := c.api.Query(context.Background(), query, time.Now())
 		if err != nil {
 			return nil, false, fmt.Errorf("error querying Prometheus: %v", err)
 		}
@@ -182,7 +221,7 @@ func (c *kubeComponent) WaitForOneOrMore(format string, args ...interface{}) err
 
 		switch v.Type() {
 		case model.ValScalar, model.ValString:
-			return nil, true, nil
+			return v, true, nil
 
 		case model.ValVector:
 			value := v.(model.Vector)
@@ -190,20 +229,26 @@ func (c *kubeComponent) WaitForOneOrMore(format string, args ...interface{}) err
 			if len(value) == 0 {
 				return nil, false, fmt.Errorf("value not found (query: %q)", query)
 			}
-			return nil, true, nil
+			return v, true, nil
 
 		default:
 			return nil, true, fmt.Errorf("unhandled value type: %v", v.Type())
 		}
 	}, retryTimeout, retryDelay)
 
-	return err
+	var v model.Value
+	if value != nil {
+		v = value.(model.Value)
+	}
+	return v, err
 }
 
-func (c *kubeComponent) WaitForOneOrMoreOrFail(t test.Failer, format string, args ...interface{}) {
-	if err := c.WaitForOneOrMore(format, args...); err != nil {
+func (c *kubeComponent) WaitForOneOrMoreOrFail(t test.Failer, format string, args ...interface{}) model.Value {
+	val, err := c.WaitForOneOrMore(format, args...)
+	if err != nil {
 		t.Fatal(err)
 	}
+	return val
 }
 
 func reduce(v model.Vector, labels map[string]string) model.Vector {
@@ -211,7 +256,7 @@ func reduce(v model.Vector, labels map[string]string) model.Vector {
 		return v
 	}
 
-	reduced := []*model.Sample{}
+	reduced := make([]*model.Sample, 0)
 
 	for _, s := range v {
 		nameCount := len(labels)
@@ -257,7 +302,11 @@ func (c *kubeComponent) SumOrFail(t test.Failer, val model.Value, labels map[str
 
 // Close implements io.Closer.
 func (c *kubeComponent) Close() error {
-	return c.forwarder.Close()
+	_ = c.forwarder.Close()
+	if c.cleanup != nil {
+		return c.cleanup()
+	}
+	return nil
 }
 
 // check equality without considering timestamps

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -137,6 +137,29 @@ func TestBuild(t *testing.T) {
 
 	if h.meshUID != "myid/myzone/mycluster" {
 		t.Errorf("Expected mesh uid to be : myid/myzone/mycluster, got: %s", h.meshUID)
+	}
+}
+
+func TestBuildWithMeshID(t *testing.T) {
+	m := &mockNC{}
+	b := &builder{
+		newClient: m.NewClient,
+		projectID: "myid",
+		zone:      "myzone",
+		cluster:   "mycluster",
+		cfg:       &config.Params{ProjectId: "myid", MeshUid: "what-a-mesh"},
+	}
+
+	mEnv := env.NewEnv(t)
+
+	han, err := b.Build(context.TODO(), mEnv)
+	h := han.(*handler)
+	if err != nil {
+		t.Errorf("Build returned unexpected err: %v", err)
+	}
+
+	if got, want := h.meshUID, "what-a-mesh"; got != want {
+		t.Errorf("handler.meshUID: got %q, want %q", got, want)
 	}
 }
 

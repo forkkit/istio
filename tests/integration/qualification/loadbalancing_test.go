@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,11 +27,11 @@ import (
 
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/bookinfo"
-	"istio.io/istio/pkg/test/framework/components/environment"
-	"istio.io/istio/pkg/test/framework/components/galley"
 	"istio.io/istio/pkg/test/framework/components/ingress"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/components/prometheus"
+	"istio.io/istio/pkg/test/framework/resource/environment"
+
 	"istio.io/pkg/log"
 )
 
@@ -44,7 +44,6 @@ const (
 
 // NOTE: To avoid noise due to autoscaling, set the following helm values to the same value (>1):
 //
-// --istio.test.env=kubernetes
 // --istio.test.kube.helm.values=gateways.istio-ingressgateway.replicaCount=3,\
 //                               gateways.istio-ingressgateway.autoscaleMin=3,\
 //                               gateways.istio-ingressgateway.autoscaleMax=3
@@ -60,8 +59,6 @@ func TestIngressLoadBalancing(t *testing.T) {
 
 	ctx.RequireOrSkip(environment.Kube)
 
-	g := galley.NewOrFail(t, ctx, galley.Config{})
-
 	bookinfoNs, err := namespace.New(ctx, namespace.Config{
 		Prefix: "istio-bookinfo",
 		Inject: true,
@@ -69,20 +66,21 @@ func TestIngressLoadBalancing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not create istio-bookinfo Namespace; err:%v", err)
 	}
-	d := bookinfo.DeployOrFail(t, ctx, bookinfo.Config{Namespace: bookinfoNs, Cfg: bookinfo.BookInfo})
+	undeploy := bookinfo.DeployOrFail(t, ctx, bookinfo.Config{Namespace: bookinfoNs, Cfg: bookinfo.BookInfo})
+	defer undeploy()
 
-	g.ApplyConfigOrFail(
+	ctx.ApplyConfigOrFail(
 		t,
-		d.Namespace(),
+		bookinfoNs.Name(),
 		bookinfo.NetworkingBookinfoGateway.LoadGatewayFileWithNamespaceOrFail(t, bookinfoNs.Name()))
-	g.ApplyConfigOrFail(
+	ctx.ApplyConfigOrFail(
 		t,
-		d.Namespace(),
+		bookinfoNs.Name(),
 		bookinfo.GetDestinationRuleConfigFileOrFail(t, ctx).LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 		bookinfo.NetworkingVirtualServiceAllV1.LoadWithNamespaceOrFail(t, bookinfoNs.Name()),
 	)
 
-	prom := prometheus.NewOrFail(t, ctx)
+	prom := prometheus.NewOrFail(t, ctx, prometheus.Config{})
 	ing := ingress.NewOrFail(t, ctx, ingress.Config{Istio: ist})
 
 	rangeStart := time.Now()
@@ -99,8 +97,8 @@ func TestIngressLoadBalancing(t *testing.T) {
 	rangeEnd := time.Now()
 
 	// Gather the CPU usage across all of the ingress gateways.
-	query := `sum(rate(container_cpu_usage_seconds_total{job='kubernetes-cadvisor', pod_name=~'istio-ingressgateway-.*'}[1m])) by (pod_name)`
-	v, err := prom.API().QueryRange(context.Background(), query, v1.Range{
+	query := `sum(rate(container_cpu_usage_seconds_total{job='kubernetes-cadvisor', pod=~'istio-ingressgateway-.*'}[1m])) by (pod_name)`
+	v, _, err := prom.API().QueryRange(context.Background(), query, v1.Range{
 		Start: rangeStart,
 		End:   rangeEnd,
 		Step:  step,

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// nolint: lll
-//go:generate go run $REPO_ROOT/pilot/tools/generate_config_crd_types.go --template $REPO_ROOT/pilot/tools/types.go.tmpl --output $REPO_ROOT/pilot/pkg/config/kube/crd/types.gen.go
-
 package crd
 
 import (
@@ -22,7 +19,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/schema"
 )
 
 // IstioKind is the generic Kubernetes API object wrapper
@@ -140,13 +136,11 @@ type IstioObject interface {
 // IstioObjectList is a k8s wrapper interface for config lists
 type IstioObjectList interface {
 	runtime.Object
+	meta_v1.ListInterface
+	meta_v1.ListMetaAccessor
 	GetItems() []IstioObject
 }
 
-func APIVersion(schema *schema.Instance) string {
-	return ResourceGroup(schema) + "/" + schema.Version
-}
-
 func APIVersionFromConfig(config *model.Config) string {
-	return config.Group + "/" + config.Version
+	return config.GroupVersionKind.Group + "/" + config.GroupVersionKind.Version
 }

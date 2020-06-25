@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package common
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/framework/components/echo"
@@ -74,6 +75,18 @@ func FillInDefaults(ctx resource.Context, defaultDomain string, c *echo.Config) 
 			portGen.Instance.SetUsed(p.InstancePort)
 		}
 	}
+	for _, p := range c.WorkloadOnlyPorts {
+		if p.Port > 0 {
+			if portGen.Instance.IsUsed(p.Port) {
+				return fmt.Errorf("failed configuring workload only port %d: port already used", p.Port)
+			}
+			portGen.Instance.SetUsed(p.Port)
+			if portGen.Service.IsUsed(p.Port) {
+				return fmt.Errorf("failed configuring workload only port %d: port already used", p.Port)
+			}
+			portGen.Service.SetUsed(p.Port)
+		}
+	}
 
 	// Second pass: try to make unassigned instance ports match service port.
 	for i, p := range c.Ports {
@@ -91,6 +104,12 @@ func FillInDefaults(ctx resource.Context, defaultDomain string, c *echo.Config) 
 		if p.InstancePort <= 0 {
 			c.Ports[i].InstancePort = portGen.Instance.Next(p.Protocol)
 		}
+	}
+
+	// If readiness probe is not specified by a test, wait a long time
+	// Waiting forever would cause the test to timeout and lose logs
+	if c.ReadinessTimeout == 0 {
+		c.ReadinessTimeout = time.Minute * 10
 	}
 
 	return nil

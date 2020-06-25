@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package chiron
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -31,8 +32,37 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	rand "k8s.io/apimachinery/pkg/util/rand"
 	certclient "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
 )
+
+const (
+	maxNameLength       = 63
+	maxDomainNameLength = 6
+	maxNamespaceLength  = 8
+	maxSecretNameLength = 8
+	randomLength        = 18
+)
+
+// getRandomCsrName returns a random name for CSR.
+func getRandomCsrName(secretName, namespace string) string {
+	domain := spiffe.GetTrustDomain()
+	if len(domain) > maxDomainNameLength {
+		domain = domain[:maxDomainNameLength]
+	}
+	if len(namespace) > maxNamespaceLength {
+		namespace = namespace[:maxNamespaceLength]
+	}
+	if len(secretName) > maxSecretNameLength {
+		secretName = secretName[:maxSecretNameLength]
+	}
+	name := fmt.Sprintf("csr-%s-%s-%s-%s",
+		domain, namespace, secretName, rand.String(randomLength))
+	if len(name) > maxNameLength {
+		name = name[:maxNameLength]
+	}
+	return name
+}
 
 // GenKeyCertK8sCA generates a certificate and key from k8s CA
 // Working flow:
@@ -57,7 +87,7 @@ func GenKeyCertK8sCA(certClient certclient.CertificateSigningRequestInterface, d
 	}
 
 	// 2. Submit the CSR
-	csrName := fmt.Sprintf("domain-%s-ns-%s-secret-%s", spiffe.GetTrustDomain(), secretNamespace, secretName)
+	csrName := getRandomCsrName(secretName, secretNamespace)
 	numRetries := 3
 	r, err := submitCSR(certClient, csrName, csrPEM, numRetries)
 	if err != nil {
@@ -75,7 +105,7 @@ func GenKeyCertK8sCA(certClient certclient.CertificateSigningRequestInterface, d
 		Reason:  csrMsg,
 		Message: csrMsg,
 	})
-	reqApproval, err := certClient.UpdateApproval(r)
+	reqApproval, err := certClient.UpdateApproval(context.TODO(), r, metav1.UpdateOptions{})
 	if err != nil {
 		log.Errorf("failed to approve CSR (%v): %v", csrName, err)
 		errCsr := cleanUpCertGen(certClient, csrName)
@@ -182,7 +212,7 @@ func submitCSR(certClient certclient.CertificateSigningRequestInterface, csrName
 	var errRet error
 	for i := 0; i < numRetries; i++ {
 		log.Debugf("trial %v to create CSR (%v)", i, csrName)
-		reqRet, errRet = certClient.Create(k8sCSR)
+		reqRet, errRet = certClient.Create(context.TODO(), k8sCSR, metav1.CreateOptions{})
 		if errRet == nil && reqRet != nil {
 			break
 		}
@@ -193,13 +223,13 @@ func submitCSR(certClient certclient.CertificateSigningRequestInterface, csrName
 		}
 		// If CSR exists, delete the existing CSR and create again
 		log.Debugf("delete an existing CSR: %v", csrName)
-		errRet = certClient.Delete(csrName, nil)
+		errRet = certClient.Delete(context.TODO(), csrName, metav1.DeleteOptions{})
 		if errRet != nil {
 			log.Errorf("failed to delete CSR (%v): %v", csrName, errRet)
 			continue
 		}
 		log.Debugf("create CSR (%v) after the existing one was deleted", csrName)
-		reqRet, errRet = certClient.Create(k8sCSR)
+		reqRet, errRet = certClient.Create(context.TODO(), k8sCSR, metav1.CreateOptions{})
 		if errRet == nil && reqRet != nil {
 			break
 		}
@@ -217,7 +247,7 @@ func readSignedCertificate(certClient certclient.CertificateSigningRequestInterf
 		for i := 0; i < maxNumRead; i++ {
 			// It takes some time for certificate to be ready, so wait first.
 			time.Sleep(readInterval)
-			r, err := certClient.Get(csrName, metav1.GetOptions{})
+			r, err := certClient.Get(context.TODO(), csrName, metav1.GetOptions{})
 			if err != nil {
 				log.Errorf("failed to get the CSR (%v): %v", csrName, err)
 				errCsr := cleanUpCertGen(certClient, csrName)
@@ -319,7 +349,7 @@ func readSignedCertificate(certClient certclient.CertificateSigningRequestInterf
 // The following nonlint is to fix the lint error: `certClient` can be `k8s.io/client-go/tools/cache.Watcher` (interfacer)
 // nolint: interfacer
 func readSignedCsr(certClient certclient.CertificateSigningRequestInterface, csrName string, timeout time.Duration) *cert.CertificateSigningRequest {
-	watcher, err := certClient.Watch(metav1.ListOptions{
+	watcher, err := certClient.Watch(context.TODO(), metav1.ListOptions{
 		FieldSelector: fields.OneTermEqualSelector("metadata.name", csrName).String(),
 	})
 	if err != nil {
@@ -346,7 +376,7 @@ func readSignedCsr(certClient certclient.CertificateSigningRequestInterface, csr
 func cleanUpCertGen(certClient certclient.CertificateSigningRequestInterface, csrName string) error {
 	// Delete CSR
 	log.Debugf("delete CSR: %v", csrName)
-	err := certClient.Delete(csrName, nil)
+	err := certClient.Delete(context.TODO(), csrName, metav1.DeleteOptions{})
 	if err != nil {
 		log.Errorf("failed to delete CSR (%v): %v", csrName, err)
 		return err

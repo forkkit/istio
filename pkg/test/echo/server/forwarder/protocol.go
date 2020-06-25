@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,16 +20,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"time"
 
 	"github.com/gorilla/websocket"
-
+	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/echo/common/scheme"
@@ -73,7 +71,7 @@ func newProtocol(cfg Config) (protocol, error) {
 
 	switch scheme.Instance(u.Scheme) {
 	case scheme.HTTP, scheme.HTTPS:
-		return &httpProtocol{
+		proto := &httpProtocol{
 			client: &http.Client{
 				Transport: &http.Transport{
 					TLSClientConfig: &tls.Config{
@@ -84,20 +82,35 @@ func newProtocol(cfg Config) (protocol, error) {
 				Timeout: timeout,
 			},
 			do: cfg.Dialer.HTTP,
-		}, nil
-	case scheme.GRPC, scheme.GRPCS:
+		}
+		if cfg.Request.Http2 && scheme.Instance(u.Scheme) == scheme.HTTPS {
+			proto.client.Transport = &http2.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+				DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+					return tls.Dial(network, addr, cfg)
+				},
+			}
+		} else if cfg.Request.Http2 {
+			proto.client.Transport = &http2.Transport{
+				// Golang doesn't have first class support for h2c, so we provide some workarounds
+				// See https://www.mailgun.com/blog/http-2-cleartext-h2c-client-example-go/
+				// So http2.Transport doesn't complain the URL scheme isn't 'https'
+				AllowHTTP: true,
+				// Pretend we are dialing a TLS endpoint. (Note, we ignore the passed tls.Config)
+				DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+					return net.Dial(network, addr)
+				},
+			}
+		}
+		return proto, nil
+	case scheme.GRPC:
 		// grpc-go sets incorrect authority header
 		authority := headers.Get(hostHeader)
 
 		// transport security
 		security := grpc.WithInsecure()
-		if scheme.Instance(u.Scheme) == scheme.GRPCS {
-			creds, err := credentials.NewClientTLSFromFile(cfg.TLSCert, authority)
-			if err != nil {
-				log.Fatalf("failed to load client certs %s %v", cfg.TLSCert, err)
-			}
-			security = grpc.WithTransportCredentials(creds)
-		}
 
 		// Strip off the scheme from the address.
 		address := rawURL[len(u.Scheme+"://"):]
@@ -117,7 +130,7 @@ func newProtocol(cfg Config) (protocol, error) {
 			conn:   grpcConn,
 			client: proto.NewEchoTestServiceClient(grpcConn),
 		}, nil
-	case scheme.WebSocket, scheme.WebSocketS:
+	case scheme.WebSocket:
 		dialer := &websocket.Dialer{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: true,
@@ -127,6 +140,21 @@ func newProtocol(cfg Config) (protocol, error) {
 		}
 		return &websocketProtocol{
 			dialer: dialer,
+		}, nil
+	case scheme.TCP:
+		dialer := net.Dialer{
+			Timeout: timeout,
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), common.ConnectionTimeout)
+		defer cancel()
+
+		address := rawURL[len(u.Scheme+"://"):]
+		tcpConn, err := cfg.Dialer.TCP(dialer, ctx, address)
+		if err != nil {
+			return nil, err
+		}
+		return &tcpProtocol{
+			conn: tcpConn,
 		}, nil
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,6 +38,9 @@ func TestParse(t *testing.T) {
 		{"http", protocol.HTTP},
 		{"HTTP", protocol.HTTP},
 		{"Http", protocol.HTTP},
+		{"http_proxy", protocol.HTTP_PROXY},
+		{"Http_Proxy", protocol.HTTP_PROXY},
+		{"HTTP_PROXY", protocol.HTTP_PROXY},
 		{"https", protocol.HTTPS},
 		{"http2", protocol.HTTP2},
 		{"grpc", protocol.GRPC},

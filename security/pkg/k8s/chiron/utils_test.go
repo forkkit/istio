@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package chiron
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -88,6 +89,16 @@ func defaultReactionFunc(obj runtime.Object) kt.ReactionFunc {
 	}
 }
 
+func TestGetRandomCsrName(t *testing.T) {
+	secretName := "very-long-secret-name-that-will-be-truncated"
+	namespaceName := "very-long-namespace-name-that-will-be-truncated"
+
+	csrName := getRandomCsrName(secretName, namespaceName)
+	if len(csrName) > maxNameLength {
+		t.Errorf("the csr name returned %v is longer than %v", csrName, maxNameLength)
+	}
+}
+
 func TestGenKeyCertK8sCA(t *testing.T) {
 	testCases := map[string]struct {
 		gracePeriodRatio  float32
@@ -96,7 +107,7 @@ func TestGenKeyCertK8sCA(t *testing.T) {
 		dnsNames          []string
 		secretNames       []string
 		serviceNamespaces []string
-		expectFaill       bool
+		expectFail        bool
 	}{
 		"gen cert should succeed": {
 			gracePeriodRatio:  0.6,
@@ -104,7 +115,7 @@ func TestGenKeyCertK8sCA(t *testing.T) {
 			dnsNames:          []string{"foo"},
 			secretNames:       []string{"istio.webhook.foo"},
 			serviceNamespaces: []string{"foo.ns"},
-			expectFaill:       false,
+			expectFail:        false,
 		},
 	}
 
@@ -130,7 +141,7 @@ func TestGenKeyCertK8sCA(t *testing.T) {
 
 		_, _, _, err = GenKeyCertK8sCA(wc.certClient.CertificateSigningRequests(), tc.dnsNames[0], tc.secretNames[0],
 			tc.serviceNamespaces[0], wc.k8sCaCertFile)
-		if tc.expectFaill {
+		if tc.expectFail {
 			if err == nil {
 				t.Errorf("should have failed")
 			}
@@ -217,7 +228,7 @@ func TestReloadCACert(t *testing.T) {
 		secretNames       []string
 		serviceNamespaces []string
 
-		expectFaill   bool
+		expectFail    bool
 		expectChanged bool
 	}{
 		"reload from valid CA cert path": {
@@ -226,7 +237,7 @@ func TestReloadCACert(t *testing.T) {
 			secretNames:       []string{"istio.webhook.foo"},
 			serviceNamespaces: []string{"foo.ns"},
 			k8sCaCertFile:     "./test-data/example-ca-cert.pem",
-			expectFaill:       false,
+			expectFail:        false,
 			expectChanged:     false,
 		},
 	}
@@ -241,7 +252,7 @@ func TestReloadCACert(t *testing.T) {
 			continue
 		}
 		changed, err := reloadCACert(wc)
-		if tc.expectFaill {
+		if tc.expectFail {
 			if err == nil {
 				t.Errorf("should have failed at reloading CA cert")
 			}
@@ -275,9 +286,9 @@ func TestSubmitCSR(t *testing.T) {
 		secretNameSpace string
 
 		createDuplicate bool
-		expectFaill     bool
+		expectFail      bool
 	}{
-		"submit a CSR without duplicate should succeed": {
+		"submitting a CSR without duplicate should succeed": {
 			gracePeriodRatio:  0.6,
 			k8sCaCertFile:     "./test-data/example-ca-cert.pem",
 			dnsNames:          []string{"foo"},
@@ -286,18 +297,18 @@ func TestSubmitCSR(t *testing.T) {
 			secretName:        "mock-secret",
 			secretNameSpace:   "mock-secret-namespace",
 			createDuplicate:   false,
-			expectFaill:       false,
+			expectFail:        false,
 		},
-		"submit a CSR with duplicate should succeed": {
+		"submitting a CSR with duplicate should succeed": {
 			gracePeriodRatio:  0.6,
+			k8sCaCertFile:     "./test-data/example-ca-cert.pem",
 			dnsNames:          []string{"foo"},
 			secretNames:       []string{"istio.webhook.foo"},
 			serviceNamespaces: []string{"foo.ns"},
-			k8sCaCertFile:     "./test-data/example-ca-cert.pem",
 			secretName:        "mock-secret",
 			secretNameSpace:   "mock-secret-namespace",
-			createDuplicate:   false,
-			expectFaill:       false,
+			createDuplicate:   true,
+			expectFail:        false,
 		},
 	}
 
@@ -346,15 +357,15 @@ func TestSubmitCSR(t *testing.T) {
 					},
 				},
 			}
-			reqRet, errRet := wc.certClient.CertificateSigningRequests().Create(k8sCSR)
-			if errRet == nil && reqRet != nil {
+			reqRet, errRet := wc.certClient.CertificateSigningRequests().Create(context.TODO(), k8sCSR, metav1.CreateOptions{})
+			if errRet != nil && reqRet == nil {
 				t.Errorf("failed to create a CSR, return is nil or error (%v)", errRet)
 				continue
 			}
 		}
 
 		r, err := submitCSR(wc.certClient.CertificateSigningRequests(), csrName, []byte(csrPEM), numRetries)
-		if tc.expectFaill {
+		if tc.expectFail {
 			if err == nil {
 				t.Errorf("should have failed")
 			}
@@ -377,7 +388,7 @@ func TestReadSignedCertificate(t *testing.T) {
 		secretNameSpace string
 
 		invalidCert bool
-		expectFaill bool
+		expectFail  bool
 	}{
 		"read signed cert should succeed": {
 			gracePeriodRatio:  0.6,
@@ -388,7 +399,7 @@ func TestReadSignedCertificate(t *testing.T) {
 			secretName:        "mock-secret",
 			secretNameSpace:   "mock-secret-namespace",
 			invalidCert:       false,
-			expectFaill:       false,
+			expectFail:        false,
 		},
 		"read invalid signed cert should fail": {
 			gracePeriodRatio:  0.6,
@@ -399,7 +410,7 @@ func TestReadSignedCertificate(t *testing.T) {
 			secretName:        "mock-secret",
 			secretNameSpace:   "mock-secret-namespace",
 			invalidCert:       true,
-			expectFaill:       true,
+			expectFail:        true,
 		},
 	}
 
@@ -440,7 +451,7 @@ func TestReadSignedCertificate(t *testing.T) {
 		csrName := fmt.Sprintf("domain-%s-ns-%s-secret-%s", spiffe.GetTrustDomain(), tc.secretNameSpace, tc.secretName)
 		_, _, err = readSignedCertificate(wc.certClient.CertificateSigningRequests(), csrName, certReadInterval, maxNumCertRead, wc.k8sCaCertFile)
 
-		if tc.expectFaill {
+		if tc.expectFail {
 			if err == nil {
 				t.Errorf("should have failed at updateMutatingWebhookConfig")
 			}

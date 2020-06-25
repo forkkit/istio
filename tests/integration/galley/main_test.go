@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,13 +18,23 @@ import (
 	"testing"
 
 	"istio.io/istio/pkg/test/framework"
-	"istio.io/istio/pkg/test/framework/components/environment"
+	"istio.io/istio/pkg/test/framework/components/environment/kube"
 	"istio.io/istio/pkg/test/framework/components/istio"
+	"istio.io/istio/pkg/test/framework/resource"
+)
+
+var (
+	cluster kube.Cluster
 )
 
 func TestMain(m *testing.M) {
 	framework.
-		NewSuite("galley_test", m).
-		SetupOnEnv(environment.Kube, istio.Setup(nil, nil)).
+		NewSuite(m).
+		Setup(istio.Setup(nil, nil)).
+		Setup(func(ctx resource.Context) error {
+			cluster = ctx.Environment().Clusters()[0].(kube.Cluster)
+			return nil
+		}).
+		RequireSingleCluster().
 		Run()
 }

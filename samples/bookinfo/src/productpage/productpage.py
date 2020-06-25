@@ -1,6 +1,6 @@
 #!/usr/bin/python
 #
-# Copyright 2017 Istio Authors
+# Copyright Istio Authors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ except ImportError:
 http_client.HTTPConnection.debuglevel = 1
 
 app = Flask(__name__)
-logging.basicConfig(filename='microservice.log', filemode='w', level=logging.DEBUG)
+logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 requests_log = logging.getLogger("requests.packages.urllib3")
 requests_log.setLevel(logging.DEBUG)
 requests_log.propagate = True
@@ -377,11 +377,9 @@ class Writer(object):
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("usage: %s port" % (sys.argv[0]))
+        logging.error("usage: %s port" % (sys.argv[0]))
         sys.exit(-1)
 
     p = int(sys.argv[1])
-    sys.stderr = Writer('stderr.log')
-    sys.stdout = Writer('stdout.log')
-    print("start at port %s" % (p))
-    app.run(host='0.0.0.0', port=p, debug=True, threaded=True)
+    logging.info("start at port %s" % (p))
+    app.run(host='::', port=p, debug=True, threaded=True)

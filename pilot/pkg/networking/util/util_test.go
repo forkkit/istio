@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,25 +19,37 @@ import (
 	"testing"
 	"time"
 
-	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
-	listener "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
-	http_conn "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	http_conn "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	xdsutil "github.com/envoyproxy/go-control-plane/pkg/wellknown"
+
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/any"
 	structpb "github.com/golang/protobuf/ptypes/struct"
 	"github.com/golang/protobuf/ptypes/wrappers"
-
-	proto2 "istio.io/istio/pkg/proto"
-
-	"github.com/golang/protobuf/proto"
 	"gopkg.in/d4l3k/messagediff.v1"
 
-	meshconfig "istio.io/api/mesh/v1alpha1"
+	networking "istio.io/api/networking/v1alpha3"
+
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pkg/config/schema/collections"
+	proto2 "istio.io/istio/pkg/proto"
 )
+
+func TestCloneLbEndpoint(t *testing.T) {
+	ep := &endpoint.LbEndpoint{
+		LoadBalancingWeight: &wrappers.UInt32Value{Value: 100},
+	}
+	cloned := CloneLbEndpoint(ep)
+	cloned.LoadBalancingWeight.Value = 200
+	if ep.LoadBalancingWeight.GetValue() != 100 {
+		t.Errorf("original LbEndpoint is mutated")
+	}
+}
 
 func TestConvertAddressToCidr(t *testing.T) {
 	tests := []struct {
@@ -100,86 +112,6 @@ func TestConvertAddressToCidr(t *testing.T) {
 	}
 }
 
-func TestGetNetworkEndpointAddress(t *testing.T) {
-	neUnix := &model.NetworkEndpoint{
-		Family:  model.AddressFamilyUnix,
-		Address: "/var/run/test/test.sock",
-	}
-	aUnix := GetNetworkEndpointAddress(neUnix)
-	if aUnix.GetPipe() == nil {
-		t.Fatalf("GetAddress() => want Pipe, got %s", aUnix.String())
-	}
-	if aUnix.GetPipe().GetPath() != neUnix.Address {
-		t.Fatalf("GetAddress() => want path %s, got %s", neUnix.Address, aUnix.GetPipe().GetPath())
-	}
-
-	neIP := &model.NetworkEndpoint{
-		Family:  model.AddressFamilyTCP,
-		Address: "192.168.10.45",
-		Port:    4558,
-	}
-	aIP := GetNetworkEndpointAddress(neIP)
-	sock := aIP.GetSocketAddress()
-	if sock == nil {
-		t.Fatalf("GetAddress() => want SocketAddress, got %s", aIP.String())
-	}
-	if sock.GetAddress() != neIP.Address {
-		t.Fatalf("GetAddress() => want %s, got %s", neIP.Address, sock.GetAddress())
-	}
-	if int(sock.GetPortValue()) != neIP.Port {
-		t.Fatalf("GetAddress() => want port %d, got port %d", neIP.Port, sock.GetPortValue())
-	}
-}
-
-func TestResolveHostsInNetworksConfig(t *testing.T) {
-	tests := []struct {
-		name     string
-		address  string
-		modified bool
-	}{
-		{
-			"Gateway with IP address",
-			"9.142.3.1",
-			false,
-		},
-		{
-			"Gateway with localhost address",
-			"localhost",
-			true,
-		},
-		{
-			"Gateway with empty address",
-			"",
-			false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			config := &meshconfig.MeshNetworks{
-				Networks: map[string]*meshconfig.Network{
-					"network": {
-						Gateways: []*meshconfig.Network_IstioNetworkGateway{
-							{
-								Gw: &meshconfig.Network_IstioNetworkGateway_Address{
-									Address: tt.address,
-								},
-							},
-						},
-					},
-				},
-			}
-			ResolveHostsInNetworksConfig(config)
-			addrAfter := config.Networks["network"].Gateways[0].GetAddress()
-			if addrAfter == tt.address && tt.modified {
-				t.Fatalf("Expected network address to be modified but it's the same as before calling the function")
-			}
-			if addrAfter != tt.address && !tt.modified {
-				t.Fatalf("Expected network address not to be modified after calling the function")
-			}
-		})
-	}
-}
-
 func TestConvertLocality(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -190,7 +122,7 @@ func TestConvertLocality(t *testing.T) {
 		{
 			name:     "nil locality",
 			locality: "",
-			want:     nil,
+			want:     &core.Locality{},
 		},
 		{
 			name:     "locality with only region",
@@ -391,12 +323,10 @@ func TestBuildConfigInfoMetadata(t *testing.T) {
 		{
 			"destination-rule",
 			model.ConfigMeta{
-				Group:     "networking.istio.io",
-				Version:   "v1alpha3",
-				Name:      "svcA",
-				Namespace: "default",
-				Domain:    "svc.cluster.local",
-				Type:      "destination-rule",
+				Name:             "svcA",
+				Namespace:        "default",
+				Domain:           "svc.cluster.local",
+				GroupVersionKind: collections.IstioNetworkingV1Alpha3Destinationrules.Resource().GroupVersionKind(),
 			},
 			&core.Metadata{
 				FilterMetadata: map[string]*structpb.Struct{
@@ -424,56 +354,63 @@ func TestBuildConfigInfoMetadata(t *testing.T) {
 	}
 }
 
-func TestCloneCluster(t *testing.T) {
-	cluster := buildFakeCluster()
-	clone := CloneCluster(cluster)
-	cluster.LoadAssignment.Endpoints[0].LoadBalancingWeight.Value = 10
-	cluster.LoadAssignment.Endpoints[0].Priority = 8
-	cluster.LoadAssignment.Endpoints[0].LbEndpoints = nil
-
-	if clone.LoadAssignment.Endpoints[0].LoadBalancingWeight.GetValue() == 10 {
-		t.Errorf("LoadBalancingWeight mutated")
-	}
-	if clone.LoadAssignment.Endpoints[0].Priority == 8 {
-		t.Errorf("Priority mutated")
-	}
-	if clone.LoadAssignment.Endpoints[0].LbEndpoints == nil {
-		t.Errorf("LbEndpoints mutated")
-	}
-}
-
-func buildFakeCluster() *v2.Cluster {
-	return &v2.Cluster{
-		Name: "outbound|8080||test.example.org",
-		LoadAssignment: &v2.ClusterLoadAssignment{
-			ClusterName: "outbound|8080||test.example.org",
-			Endpoints: []*endpoint.LocalityLbEndpoints{
-				{
-					Locality: &core.Locality{
-						Region:  "region1",
-						Zone:    "zone1",
-						SubZone: "subzone1",
+func TestAddSubsetToMetadata(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     *core.Metadata
+		subset string
+		want   *core.Metadata
+	}{
+		{
+			"simple subset",
+			&core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					IstioMetadataKey: {
+						Fields: map[string]*structpb.Value{
+							"config": {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+								},
+							},
+						},
 					},
-					LbEndpoints: []*endpoint.LbEndpoint{},
-					LoadBalancingWeight: &wrappers.UInt32Value{
-						Value: 1,
-					},
-					Priority: 0,
 				},
-				{
-					Locality: &core.Locality{
-						Region:  "region1",
-						Zone:    "zone1",
-						SubZone: "subzone2",
+			},
+			"test-subset",
+			&core.Metadata{
+				FilterMetadata: map[string]*structpb.Struct{
+					IstioMetadataKey: {
+						Fields: map[string]*structpb.Value{
+							"config": {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
+								},
+							},
+							"subset": {
+								Kind: &structpb.Value_StringValue{
+									StringValue: "test-subset",
+								},
+							},
+						},
 					},
-					LbEndpoints: []*endpoint.LbEndpoint{},
-					LoadBalancingWeight: &wrappers.UInt32Value{
-						Value: 1,
-					},
-					Priority: 0,
 				},
 			},
 		},
+		{
+			"no metadata",
+			&core.Metadata{},
+			"test-subset",
+			&core.Metadata{},
+		},
+	}
+
+	for _, v := range cases {
+		t.Run(v.name, func(tt *testing.T) {
+			got := AddSubsetToMetadata(v.in, v.subset)
+			if diff, equal := messagediff.PrettyDiff(got, v.want); !equal {
+				tt.Errorf("AddSubsetToMetadata(%v, %s) produced incorrect result:\ngot: %v\nwant: %v\nDiff: %s", v.in, v.subset, got, v.want, diff)
+			}
+		})
 	}
 }
 
@@ -503,65 +440,6 @@ func TestIsHTTPFilterChain(t *testing.T) {
 	}
 }
 
-var (
-	listener80 = &v2.Listener{Address: BuildAddress("0.0.0.0", 80)}
-	listener81 = &v2.Listener{Address: BuildAddress("0.0.0.0", 81)}
-	listenerip = &v2.Listener{Address: BuildAddress("1.1.1.1", 80)}
-)
-
-func BenchmarkGetByAddress(b *testing.B) {
-	for n := 0; n < b.N; n++ {
-		GetByAddress([]*v2.Listener{
-			listener80,
-			listener81,
-			listenerip,
-		}, *listenerip.Address)
-	}
-}
-
-func TestGetByAddress(t *testing.T) {
-	tests := []struct {
-		name      string
-		listeners []*v2.Listener
-		address   *core.Address
-		expected  *v2.Listener
-	}{
-		{
-			"no listeners",
-			[]*v2.Listener{},
-			BuildAddress("0.0.0.0", 80),
-			nil,
-		},
-		{
-			"single listener",
-			[]*v2.Listener{
-				listener80,
-			},
-			BuildAddress("0.0.0.0", 80),
-			listener80,
-		},
-		{
-			"multiple listeners",
-			[]*v2.Listener{
-				listener81,
-				listenerip,
-				listener80,
-			},
-			BuildAddress("0.0.0.0", 80),
-			listener80,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := GetByAddress(tt.listeners, *tt.address)
-			if got != tt.expected {
-				t.Errorf("Got %v, expected %v", got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestMergeAnyWithStruct(t *testing.T) {
 	inHCM := &http_conn.HttpConnectionManager{
 		CodecType:  http_conn.HttpConnectionManager_HTTP1,
@@ -583,7 +461,6 @@ func TestMergeAnyWithStruct(t *testing.T) {
 	newTimeout := ptypes.DurationProto(5 * time.Minute)
 	userHCM := &http_conn.HttpConnectionManager{
 		AddUserAgent:      proto2.BoolTrue,
-		IdleTimeout:       newTimeout,
 		StreamIdleTimeout: newTimeout,
 		UseRemoteAddress:  proto2.BoolTrue,
 		XffNumTrustedHops: 5,
@@ -597,7 +474,6 @@ func TestMergeAnyWithStruct(t *testing.T) {
 
 	expectedHCM := proto.Clone(inHCM).(*http_conn.HttpConnectionManager)
 	expectedHCM.AddUserAgent = userHCM.AddUserAgent
-	expectedHCM.IdleTimeout = userHCM.IdleTimeout
 	expectedHCM.StreamIdleTimeout = userHCM.StreamIdleTimeout
 	expectedHCM.UseRemoteAddress = userHCM.UseRemoteAddress
 	expectedHCM.XffNumTrustedHops = userHCM.XffNumTrustedHops
@@ -621,31 +497,439 @@ func TestMergeAnyWithStruct(t *testing.T) {
 	}
 }
 
-func TestHandleCrash(t *testing.T) {
-	defer func() {
-		if x := recover(); x != nil {
-			t.Errorf("Expected no panic ")
-		}
-	}()
-
-	defer HandleCrash()
-	panic("test")
+func TestIsAllowAnyOutbound(t *testing.T) {
+	tests := []struct {
+		name   string
+		node   *model.Proxy
+		result bool
+	}{
+		{
+			name:   "NilSidecarScope",
+			node:   &model.Proxy{},
+			result: false,
+		},
+		{
+			name: "NilOutboundTrafficPolicy",
+			node: &model.Proxy{
+				SidecarScope: &model.SidecarScope{},
+			},
+			result: false,
+		},
+		{
+			name: "OutboundTrafficPolicyRegistryOnly",
+			node: &model.Proxy{
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_REGISTRY_ONLY,
+					},
+				},
+			},
+			result: false,
+		},
+		{
+			name: "OutboundTrafficPolicyAllowAny",
+			node: &model.Proxy{
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_ALLOW_ANY,
+					},
+				},
+			},
+			result: true,
+		},
+	}
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			out := IsAllowAnyOutbound(tests[i].node)
+			if out != tests[i].result {
+				t.Errorf("Expected %t but got %t for test case: %v\n", tests[i].result, out, tests[i].node)
+			}
+		})
+	}
 }
 
-func TestCustomHandleCrash(t *testing.T) {
-	ch := make(chan struct{}, 1)
-	defer func() {
-		select {
-		case <-ch:
-			t.Logf("crash handler called")
-		case <-time.After(1 * time.Second):
-			t.Errorf("Custom handler not called")
-		}
-	}()
+func TestBuildStatPrefix(t *testing.T) {
+	tests := []struct {
+		name        string
+		statPattern string
+		host        string
+		subsetName  string
+		port        *model.Port
+		attributes  model.ServiceAttributes
+		want        string
+	}{
+		{
+			"Service only pattern",
+			"%SERVICE%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default",
+		},
+		{
+			"Service only pattern from different namespace",
+			"%SERVICE%",
+			"reviews.namespace1.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "namespace1",
+			},
+			"reviews.namespace1",
+		},
+		{
+			"Service with port pattern from different namespace",
+			"%SERVICE%.%SERVICE_PORT%",
+			"reviews.namespace1.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "namespace1",
+			},
+			"reviews.namespace1.7443",
+		},
+		{
+			"Service from non k8s registry",
+			"%SERVICE%.%SERVICE_PORT%",
+			"reviews.hostname.consul",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Consul),
+				Name:            "foo",
+				Namespace:       "bar",
+			},
+			"reviews.hostname.consul.7443",
+		},
+		{
+			"Service FQDN only pattern",
+			"%SERVICE_FQDN%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default.svc.cluster.local",
+		},
+		{
+			"Service With Port pattern",
+			"%SERVICE%_%SERVICE_PORT%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default_7443",
+		},
+		{
+			"Service With Port Name pattern",
+			"%SERVICE%_%SERVICE_PORT_NAME%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default_grpc-svc",
+		},
+		{
+			"Service With Port and Port Name pattern",
+			"%SERVICE%_%SERVICE_PORT_NAME%_%SERVICE_PORT%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default_grpc-svc_7443",
+		},
+		{
+			"Service FQDN With Port pattern",
+			"%SERVICE_FQDN%_%SERVICE_PORT%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default.svc.cluster.local_7443",
+		},
+		{
+			"Service FQDN With Port Name pattern",
+			"%SERVICE_FQDN%_%SERVICE_PORT_NAME%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default.svc.cluster.local_grpc-svc",
+		},
+		{
+			"Service FQDN With Port and Port Name pattern",
+			"%SERVICE_FQDN%_%SERVICE_PORT_NAME%_%SERVICE_PORT%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default.svc.cluster.local_grpc-svc_7443",
+		},
+		{
+			"Service FQDN With Empty Subset, Port and Port Name pattern",
+			"%SERVICE_FQDN%%SUBSET_NAME%_%SERVICE_PORT_NAME%_%SERVICE_PORT%",
+			"reviews.default.svc.cluster.local",
+			"",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default.svc.cluster.local_grpc-svc_7443",
+		},
+		{
+			"Service FQDN With Subset, Port and Port Name pattern",
+			"%SERVICE_FQDN%.%SUBSET_NAME%.%SERVICE_PORT_NAME%_%SERVICE_PORT%",
+			"reviews.default.svc.cluster.local",
+			"v1",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default.svc.cluster.local.v1.grpc-svc_7443",
+		},
+		{
+			"Service FQDN With Unknown Pattern",
+			"%SERVICE_FQDN%.%DUMMY%",
+			"reviews.default.svc.cluster.local",
+			"v1",
+			&model.Port{Name: "grpc-svc", Port: 7443, Protocol: "GRPC"},
+			model.ServiceAttributes{
+				ServiceRegistry: string(serviceregistry.Kubernetes),
+				Name:            "reviews",
+				Namespace:       "default",
+			},
+			"reviews.default.svc.cluster.local.%DUMMY%",
+		},
+	}
 
-	defer HandleCrash(func() {
-		ch <- struct{}{}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BuildStatPrefix(tt.statPattern, tt.host, tt.subsetName, tt.port, tt.attributes)
+			if got != tt.want {
+				t.Errorf("Expected alt statname %s, but got %s", tt.want, got)
+			}
+		})
+	}
+}
 
-	panic("test")
+func TestBuildAddress(t *testing.T) {
+	testCases := []struct {
+		name     string
+		addr     string
+		port     uint32
+		expected *core.Address
+	}{
+		{
+			name: "ipv4",
+			addr: "172.10.10.1",
+			port: 8080,
+			expected: &core.Address{
+				Address: &core.Address_SocketAddress{
+					SocketAddress: &core.SocketAddress{
+						Address: "172.10.10.1",
+						PortSpecifier: &core.SocketAddress_PortValue{
+							PortValue: 8080,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "ipv6",
+			addr: "fe80::10e7:52ff:fecd:198b",
+			port: 8080,
+			expected: &core.Address{
+				Address: &core.Address_SocketAddress{
+					SocketAddress: &core.SocketAddress{
+						Address: "fe80::10e7:52ff:fecd:198b",
+						PortSpecifier: &core.SocketAddress_PortValue{
+							PortValue: 8080,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "uds",
+			addr: "/var/run/test/socket",
+			port: 0,
+			expected: &core.Address{
+				Address: &core.Address_Pipe{
+					Pipe: &core.Pipe{
+						Path: "/var/run/test/socket",
+					},
+				},
+			},
+		},
+		{
+			name: "uds with unix prefix",
+			addr: "unix:///var/run/test/socket",
+			port: 0,
+			expected: &core.Address{
+				Address: &core.Address_Pipe{
+					Pipe: &core.Pipe{
+						Path: "/var/run/test/socket",
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			addr := BuildAddressV2(test.addr, test.port)
+			if !reflect.DeepEqual(addr, test.expected) {
+				t.Errorf("expected add %v, but got %v", test.expected, addr)
+			}
+		})
+	}
+}
+
+func TestCidrRangeSliceEqual(t *testing.T) {
+	tests := []struct {
+		name   string
+		first  []*core.CidrRange
+		second []*core.CidrRange
+		want   bool
+	}{
+		{
+			"both nil",
+			nil,
+			nil,
+			true,
+		},
+		{
+			"unequal length",
+			[]*core.CidrRange{
+				{
+					AddressPrefix: "1.2.3.4",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 32,
+					},
+				},
+				{
+					AddressPrefix: "1.2.3.5",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 32,
+					},
+				},
+			},
+			[]*core.CidrRange{
+				{
+					AddressPrefix: "1.2.3.4",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 32,
+					},
+				},
+			},
+			false,
+		},
+		{
+			"equal cidr",
+			[]*core.CidrRange{
+				{
+					AddressPrefix: "1.2.3.4",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 32,
+					},
+				},
+			},
+			[]*core.CidrRange{
+				{
+					AddressPrefix: "1.2.3.4",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 32,
+					},
+				},
+			},
+			true,
+		},
+		{
+			"unequal cidr address prefix mismatch",
+			[]*core.CidrRange{
+				{
+					AddressPrefix: "1.2.3.4",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 32,
+					},
+				},
+			},
+			[]*core.CidrRange{
+				{
+					AddressPrefix: "1.2.3.5",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 32,
+					},
+				},
+			},
+			false,
+		},
+		{
+			"unequal cidr prefixlen mismatch",
+			[]*core.CidrRange{
+				{
+					AddressPrefix: "1.2.3.4",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 32,
+					},
+				},
+			},
+			[]*core.CidrRange{
+				{
+					AddressPrefix: "1.2.3.4",
+					PrefixLen: &wrappers.UInt32Value{
+						Value: 16,
+					},
+				},
+			},
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CidrRangeSliceEqual(tt.first, tt.second); got != tt.want {
+				t.Errorf("Unexpected CidrRangeSliceEqual() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

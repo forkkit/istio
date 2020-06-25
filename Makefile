@@ -19,6 +19,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+SHELL := /bin/bash
+
 # allow optional per-repo overrides
 -include Makefile.overrides.mk
 
@@ -28,70 +30,42 @@
 # figure out all the tools you need in your environment to make that work.
 export BUILD_WITH_CONTAINER ?= 0
 
-LOCAL_ARCH := $(shell uname -m)
-ifeq ($(LOCAL_ARCH),x86_64)
-    TARGET_ARCH ?= amd64
-else ifeq ($(shell echo $(LOCAL_ARCH) | head -c 5),armv8)
-    TARGET_ARCH ?= arm64
-else ifeq ($(shell echo $(LOCAL_ARCH) | head -c 4),armv)
-    TARGET_ARCH ?= arm
-else
-    $(error This system's architecture $(LOCAL_ARCH) isn't supported)
-endif
-
-LOCAL_OS := $(shell uname)
-ifeq ($(LOCAL_OS),Linux)
-    TARGET_OS ?= linux
-    READLINK_FLAGS="-f"
-else ifeq ($(LOCAL_OS),Darwin)
-    TARGET_OS ?= darwin
-    READLINK_FLAGS=""
-else
-    $(error This system's OS $(LOCAL_OS) isn't supported)
-endif
-
-export TARGET_OUT ?= $(shell pwd)/out/$(TARGET_ARCH)_$(TARGET_OS)
-
 ifeq ($(BUILD_WITH_CONTAINER),1)
-export TARGET_OUT = /work/out/$(TARGET_ARCH)_$(TARGET_OS)
-CONTAINER_CLI ?= docker
-DOCKER_SOCKET_MOUNT ?= -v /var/run/docker.sock:/var/run/docker.sock
-IMG ?= gcr.io/istio-testing/build-tools:2019-10-11T13-37-52
-UID = $(shell id -u)
-PWD = $(shell pwd)
 
-$(info Building with the build container: $(IMG).)
+# An export free of arugments in a Makefile places all variables in the Makefile into the
+# environment. This is needed to allow overrides from Makefile.overrides.mk.
+export
 
-# Determine the timezone across various platforms to pass into the
-# docker run operation. This operation assumes zoneinfo is within
-# the path of the file.
-TIMEZONE=`readlink $(READLINK_FLAGS) /etc/localtime | sed -e 's/^.*zoneinfo\///'`
+$(shell $(shell pwd)/common/scripts/setup_env.sh)
 
-RUN = $(CONTAINER_CLI) run --net=host -t -i --sig-proxy=true -u $(UID):docker --rm \
-	-e IN_BUILD_CONTAINER="$(BUILD_WITH_CONTAINER)" \
-	-e TZ="$(TIMEZONE)" \
-	-e TARGET_ARCH="$(TARGET_ARCH)" \
-	-e TARGET_OS="$(TARGET_OS)" \
-	-e TARGET_OUT="$(TARGET_OUT)" \
-	-v /etc/passwd:/etc/passwd:ro \
-	$(DOCKER_SOCKET_MOUNT) \
-	$(CONTAINER_OPTIONS) \
-	--mount type=bind,source="$(PWD)",destination="/work" \
-	--mount type=volume,source=go,destination="/go" \
-	--mount type=volume,source=gocache,destination="/gocache" \
-	-w /work $(IMG)
-else
-$(info Building with your local toolchain.)
-RUN =
-GOBIN ?= $(GOPATH)/bin
-endif
+RUN = ./common/scripts/run.sh
 
-MAKE = $(RUN) make --no-print-directory -e -f Makefile.core.mk
+MAKE_DOCKER = $(RUN) make --no-print-directory -e -f Makefile.core.mk
 
 %:
-	@$(MAKE) $@
+	@$(MAKE_DOCKER) $@
 
 default:
-	@$(MAKE)
+	@$(MAKE_DOCKER)
+
+shell:
+	@$(RUN) /bin/bash
 
 .PHONY: default
+
+else
+
+# If we are not in build container, we need a workaround to get environment properly set
+# Write to file, then include
+$(shell mkdir -p out)
+$(shell $(shell pwd)/common/scripts/setup_env.sh envfile > out/.env)
+include out/.env
+# An export free of arugments in a Makefile places all variables in the Makefile into the
+# environment. This behavior may be surprising to many that use shell often, which simply
+# displays the existing environment
+export
+
+export GOBIN ?= $(GOPATH)/bin
+include Makefile.core.mk
+
+endif

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,16 +16,20 @@ package kube
 
 import (
 	"fmt"
+	"strconv"
 	"text/template"
 
+	"github.com/Masterminds/sprig"
+
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/core/image"
-	"istio.io/istio/pkg/test/scopes"
+	"istio.io/istio/pkg/test/framework/components/environment/kube"
+	"istio.io/istio/pkg/test/framework/components/istio"
+	"istio.io/istio/pkg/test/framework/image"
 	"istio.io/istio/pkg/test/util/tmpl"
 )
 
 const (
-	deploymentYAML = `
+	serviceYAML = `
 {{- if .ServiceAccount }}
 apiVersion: v1
 kind: ServiceAccount
@@ -42,7 +46,7 @@ metadata:
 {{- if .ServiceAnnotations }}
   annotations:
 {{- range $name, $value := .ServiceAnnotations }}
-    {{ $name }}: {{ printf "%q" $value }}
+    {{ $name.Name }}: {{ printf "%q" $value.Value }}
 {{- end }}
 {{- end }}
 spec:
@@ -57,59 +61,86 @@ spec:
 {{- end }}
   selector:
     app: {{ .Service }}
----
+`
+
+	deploymentYAML = `
+{{- $subsets := .Subsets }}
+{{- $cluster := .Cluster }}
+{{- range $i, $subset := $subsets }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Service }}-{{ .Version }}
+  name: {{ $.Service }}-{{ $subset.Version }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: {{ .Service }}
-      version: {{ .Version }}
-{{- if ne .Locality "" }}
-      istio-locality: {{ .Locality }}
+      app: {{ $.Service }}
+      version: {{ $subset.Version }}
+{{- if ne $.Locality "" }}
+      istio-locality: {{ $.Locality }}
 {{- end }}
   template:
     metadata:
       labels:
-        app: {{ .Service }}
-        version: {{ .Version }}
-{{- if ne .Locality "" }}
-        istio-locality: {{ .Locality }}
+        app: {{ $.Service }}
+        version: {{ $subset.Version }}
+{{- if ne $.Locality "" }}
+        istio-locality: {{ $.Locality }}
 {{- end }}
       annotations:
-        foo: bar
-{{- if .WorkloadAnnotations }}
-{{- range $name, $value := .WorkloadAnnotations }}
-        {{ $name }}: {{ printf "%q" $value }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15014"
+{{- range $name, $value := $subset.Annotations }}
+        {{ $name.Name }}: {{ printf "%q" $value.Value }}
 {{- end }}
-{{- end }}
-{{- if .IncludeInboundPorts }}
-        traffic.sidecar.istio.io/includeInboundPorts: "{{ .IncludeInboundPorts }}"
+{{- if $.IncludeInboundPorts }}
+        traffic.sidecar.istio.io/includeInboundPorts: "{{ $.IncludeInboundPorts }}"
 {{- end }}
     spec:
-{{- if .ServiceAccount }}
-      serviceAccountName: {{ .Service }}
+{{- if $.ServiceAccount }}
+      serviceAccountName: {{ $.Service }}
 {{- end }}
       containers:
       - name: app
-        image: {{ .Hub }}/app:{{ .Tag }}
-        imagePullPolicy: {{ .PullPolicy }}
+        image: {{ $.Hub }}/app:{{ $.Tag }}
+        imagePullPolicy: {{ $.PullPolicy }}
         args:
-{{- range $i, $p := .ContainerPorts }}
+          - --metrics=15014
+          - --cluster
+          - "{{ $cluster }}"
+{{- range $i, $p := $.ContainerPorts }}
 {{- if eq .Protocol "GRPC" }}
           - --grpc
+{{- else if eq .Protocol "TCP" }}
+          - --tcp
 {{- else }}
           - --port
 {{- end }}
           - "{{ $p.Port }}"
+{{- if $p.TLS }}
+          - --tls={{ $p.Port }}
+{{- end }}
+{{- end }}
+{{- range $i, $p := $.WorkloadOnlyPorts }}
+{{- if eq .Protocol "TCP" }}
+          - --tcp
+{{- else }}
+          - --port
+{{- end }}
+          - "{{ $p.Port }}"
+{{- if $p.TLS }}
+          - --tls={{ $p.Port }}
+{{- end }}
 {{- end }}
           - --version
-          - "{{ .Version }}"
+          - "{{ $subset.Version }}"
+{{- if $.TLSSettings }}
+          - --crt=/etc/certs/custom/cert-chain.pem
+          - --key=/etc/certs/custom/key.pem
+{{- end }}
         ports:
-{{- range $i, $p := .ContainerPorts }}
+{{- range $i, $p := $.ContainerPorts }}
         - containerPort: {{ $p.Port }} 
 {{- if eq .Port 3333 }}
           name: tcp-health-port
@@ -119,8 +150,8 @@ spec:
           httpGet:
             path: /
             port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 10
+          initialDelaySeconds: 1
+          periodSeconds: 2
           failureThreshold: 10
         livenessProbe:
           tcpSocket:
@@ -128,60 +159,196 @@ spec:
           initialDelaySeconds: 10
           periodSeconds: 10
           failureThreshold: 10
+{{- if $.TLSSettings }}
+        volumeMounts:
+        - mountPath: /etc/certs/custom
+          name: custom-certs
+      volumes:
+      - configMap:
+          name: {{ $.Service }}-certs
+        name: custom-certs
+{{- end}}
 ---
+{{- end}}
+{{- if .TLSSettings }}
 apiVersion: v1
-kind: Secret
+kind: ConfigMap
 metadata:
-  name: sdstokensecret
-type: Opaque
-stringData:
-  sdstoken: "eyJhbGciOiJSUzI1NiIsImtpZCI6IiJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2\
-VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJkZWZhdWx0Ii\
-wia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9zZWNyZXQubmFtZSI6InZhdWx0LWNpdGFkZWwtc2\
-EtdG9rZW4tNzR0d3MiLCJrdWJlcm5ldGVzLmlvL3NlcnZpY2VhY2NvdW50L3NlcnZpY2UtYWNjb3VudC\
-5uYW1lIjoidmF1bHQtY2l0YWRlbC1zYSIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2Vydm\
-ljZS1hY2NvdW50LnVpZCI6IjJhYzAzYmEyLTY5MTUtMTFlOS05NjkwLTQyMDEwYThhMDExNCIsInN1Yi\
-I6InN5c3RlbTpzZXJ2aWNlYWNjb3VudDpkZWZhdWx0OnZhdWx0LWNpdGFkZWwtc2EifQ.pZ8SiyNeO0p\
-1p8HB9oXvXOAI1XCJZKk2wVHXBsTSzKWxlVD9HrHbAcSbO2dlhFpeCgknt6eZywvhShZJh2F6-iHP_Yo\
-UVoCqQmzjPoB3c3JoYFpJo-9jTN1_mNRtZUcNvYl-tDlTmBlaKEvoC5P2WGVUF3AoLsES66u4FG9Wllm\
-LV92LG1WNqx_ltkT1tahSy9WiHQgyzPqwtwE72T1jAGdgVIoJy1lfSaLam_bo9rqkRlgSg-au9BAjZiD\
-Gtm9tf3lwrcgfbxccdlG4jAsTFa2aNs3dW4NLk7mFnWCJa-iWj-TgFxf9TW-9XPK0g3oYIQ0Id0CIW2S\
-iFxKGPAjB-g"
+  name: {{ $.Service }}-certs
+data:
+  root-cert.pem: |
+{{ .TLSSettings.RootCert | indent 4 }}
+  cert-chain.pem: |
+{{ .TLSSettings.ClientCert | indent 4 }}
+  key.pem: |
+{{.TLSSettings.Key | indent 4}}
+---
+{{- end}}
 `
+
+	// vmDeploymentYaml aims to simulate a VM, but instead of managing the complex test setup of spinning up a VM,
+	// connecting, etc we run it inside a pod. The pod has pretty much all Kubernetes features disabled (DNS and SA token mount)
+	// such that we can adequately simulate a VM and DIY the bootstrapping.
+	vmDeploymentYaml = `
+{{- $cluster := .Cluster }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $.Service }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      istio.io/test-vm: {{ $.Service }}
+  template:
+    metadata:
+      annotations:
+        # Sidecar is inside the pod to simulate VMs - do not inject
+        sidecar.istio.io/inject: "false"
+      labels:
+        # Label should not be selected. We will create a workload entry instead
+        istio.io/test-vm: {{ $.Service }}
+    spec:
+      # Disable kube-dns, to mirror VM
+      dnsPolicy: Default
+      # Disable service account mount, to mirror VM
+      automountServiceAccountToken: false
+      containers:
+      - name: istio-proxy
+        image: {{ $.Hub }}/{{ $.VM.Image }}:{{ $.Tag }}
+        #image: {{ $.Hub }}/app_sidecar:{{ $.Tag }}
+        imagePullPolicy: {{ $.PullPolicy }}
+        securityContext:
+          capabilities:
+            add:
+            - NET_ADMIN
+          runAsUser: 1338
+          runAsGroup: 1338
+        command:
+        - bash
+        - -c
+        - |-
+          sudo sh -c 'echo ISTIO_SERVICE_CIDR=* > /var/lib/istio/envoy/cluster.env'
+          sudo sh -c 'echo ISTIO_PILOT_PORT={{$.VM.IstiodPort}} >> /var/lib/istio/envoy/cluster.env'
+          sudo sh -c 'echo "{{$.VM.IstiodIP}} istiod.istio-system.svc" >> /etc/hosts'
+          sudo sh -c 'echo "1.1.1.1 pod.{{$.Namespace}}.svc.cluster.local" >> /etc/hosts'
+
+          # TODO: run with systemctl?
+          sudo -E /usr/local/bin/istio-start.sh&
+          /usr/local/bin/server --cluster "{{ $cluster }}" \
+{{- range $i, $p := $.ContainerPorts }}
+{{- if eq .Protocol "GRPC" }}
+             --grpc \
+{{- else if eq .Protocol "TCP" }}
+             --tcp \
+{{- else }}
+             --port \
+{{- end }}
+             "{{ $p.Port }}" \
+{{- end }}
+        env:
+        # We use token not certs
+        - name: PROV_CERT
+          value: ""
+        # By default we do not capture inbound. For these tests we will mark as capture all
+        - name: ISTIO_INBOUND_PORTS
+          value: "*"
+        # Block standard inbound ports
+        - name: ISTIO_LOCAL_EXCLUDE_PORTS
+          value: "15090,15021,15020"
+        readinessProbe:
+          httpGet:
+            path: /healthz/ready
+            port: 15021
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          failureThreshold: 10
+        volumeMounts:
+        - mountPath: /var/run/secrets/tokens
+          name: {{ $.Service }}-istio-token
+        - mountPath: /var/run/secrets/istio
+          name: istio-ca-root-cert
+      volumes:
+      - secret:
+          secretName: {{ $.Service }}-istio-token
+        name: {{ $.Service }}-istio-token
+      - configMap:
+          name: istio-ca-root-cert
+        name: istio-ca-root-cert`
 )
 
 var (
-	deploymentTemplate *template.Template
+	serviceTemplate      *template.Template
+	deploymentTemplate   *template.Template
+	vmDeploymentTemplate *template.Template
 )
 
 func init() {
+	serviceTemplate = template.New("echo_service")
+	if _, err := serviceTemplate.Funcs(sprig.TxtFuncMap()).Parse(serviceYAML); err != nil {
+		panic(fmt.Sprintf("unable to parse echo service template: %v", err))
+	}
+
 	deploymentTemplate = template.New("echo_deployment")
-	if _, err := deploymentTemplate.Parse(deploymentYAML); err != nil {
+	if _, err := deploymentTemplate.Funcs(sprig.TxtFuncMap()).Parse(deploymentYAML); err != nil {
 		panic(fmt.Sprintf("unable to parse echo deployment template: %v", err))
+	}
+
+	vmDeploymentTemplate = template.New("echo_vm_deployment")
+	if _, err := vmDeploymentTemplate.Funcs(sprig.TxtFuncMap()).Parse(vmDeploymentYaml); err != nil {
+		panic(fmt.Sprintf("unable to parse echo vm deployment template: %v", err))
 	}
 }
 
-func generateYAML(cfg echo.Config) (string, error) {
+func generateYAML(cfg echo.Config, cluster kube.Cluster) (serviceYAML string, deploymentYAML string, err error) {
 	// Create the parameters for the YAML template.
 	settings, err := image.SettingsFromCommandLine()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	return generateYAMLWithSettings(cfg, settings, cluster)
+}
 
-	// Separate the annotations.
-	serviceAnnotations := make(map[string]string)
-	workloadAnnotations := make(map[string]string)
-	for k, v := range cfg.Annotations {
-		switch k.Type {
-		case echo.ServiceAnnotation:
-			serviceAnnotations[k.Name] = v.Value
-		case echo.WorkloadAnnotation:
-			workloadAnnotations[k.Name] = v.Value
-		default:
-			scopes.Framework.Warnf("annotation %s with unknown type %s", k.Name, k.Type)
+func generateYAMLWithSettings(cfg echo.Config, settings *image.Settings, cluster kube.Cluster) (serviceYAML string, deploymentYAML string, err error) {
+	// Convert legacy config to workload oritended.
+	if cfg.Subsets == nil {
+		cfg.Subsets = []echo.SubsetConfig{
+			{
+				Version: cfg.Version,
+			},
 		}
 	}
 
+	for i := range cfg.Subsets {
+		if cfg.Subsets[i].Version == "" {
+			cfg.Subsets[i].Version = "v1"
+		}
+	}
+
+	var vmImage, istiodIP, istiodPort string
+	if cfg.DeployAsVM {
+		s, err := kube.NewSettingsFromCommandLine()
+		if err != nil {
+			return "", "", err
+		}
+		addr, err := istio.GetRemoteDiscoveryAddress("istio-system", cluster, s.Minikube)
+		if err != nil {
+			return "", "", err
+		}
+		istiodIP = addr.IP.String()
+		istiodPort = strconv.Itoa(addr.Port)
+
+		// if image is not provided, default to app_sidecar
+		if cfg.VMImage == "" {
+			vmImage = "app_sidecar_ubuntu_bionic"
+		} else {
+			vmImage = cfg.VMImage
+		}
+	}
+	namespace := ""
+	if cfg.Namespace != nil {
+		namespace = cfg.Namespace.Name()
+	}
 	params := map[string]interface{}{
 		"Hub":                 settings.Hub,
 		"Tag":                 settings.Tag,
@@ -192,12 +359,32 @@ func generateYAML(cfg echo.Config) (string, error) {
 		"Locality":            cfg.Locality,
 		"ServiceAccount":      cfg.ServiceAccount,
 		"Ports":               cfg.Ports,
+		"WorkloadOnlyPorts":   cfg.WorkloadOnlyPorts,
 		"ContainerPorts":      getContainerPorts(cfg.Ports),
-		"ServiceAnnotations":  serviceAnnotations,
-		"WorkloadAnnotations": workloadAnnotations,
+		"ServiceAnnotations":  cfg.ServiceAnnotations,
 		"IncludeInboundPorts": cfg.IncludeInboundPorts,
+		"Subsets":             cfg.Subsets,
+		"TLSSettings":         cfg.TLSSettings,
+		"Cluster":             cfg.ClusterIndex(),
+		"Namespace":           namespace,
+		"VM": map[string]interface{}{
+			"Image":      vmImage,
+			"IstiodIP":   istiodIP,
+			"IstiodPort": istiodPort,
+		},
+	}
+
+	serviceYAML, err = tmpl.Execute(serviceTemplate, params)
+	if err != nil {
+		return
+	}
+
+	deploy := deploymentTemplate
+	if cfg.DeployAsVM {
+		deploy = vmDeploymentTemplate
 	}
 
 	// Generate the YAML content.
-	return tmpl.Execute(deploymentTemplate, params)
+	deploymentYAML, err = tmpl.Execute(deploy, params)
+	return
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,143 +15,107 @@
 package aggregate_test
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/onsi/gomega"
+	"go.uber.org/atomic"
 
+	"istio.io/istio/galley/pkg/config/testing/fixtures"
 	"istio.io/istio/pilot/pkg/config/aggregate"
-	"istio.io/istio/pilot/pkg/config/aggregate/fakes"
+	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
 func TestAggregateStoreBasicMake(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeTwo := &fakes.ConfigStoreCache{}
+	schema1 := collections.K8SServiceApisV1Alpha1Httproutes
+	schema2 := collections.K8SServiceApisV1Alpha1Gatewayclasses
+	store1 := memory.Make(collection.SchemasFor(schema1))
+	store2 := memory.Make(collection.SchemasFor(schema2))
 
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.DestinationRule",
-	}})
-
-	storeTwo.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "other-config",
-		Plural:      "other-configs",
-		MessageName: "istio.networking.v1alpha3.Gateway",
-	}})
-
-	stores := []model.ConfigStore{storeOne, storeTwo}
+	stores := []model.ConfigStore{store1, store2}
 
 	store, err := aggregate.Make(stores)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
-	descriptors := store.ConfigDescriptor()
-	g.Expect(descriptors).To(gomega.HaveLen(2))
-	g.Expect(descriptors).To(gomega.ConsistOf([]schema.Instance{
-		{
-			Type:        "some-config",
-			Plural:      "some-configs",
-			MessageName: "istio.networking.v1alpha3.DestinationRule",
-		},
-		{
-			Type:        "other-config",
-			Plural:      "other-configs",
-			MessageName: "istio.networking.v1alpha3.Gateway",
-		},
-	}))
+	schemas := store.Schemas()
+	g.Expect(schemas.All()).To(gomega.HaveLen(2))
+	fixtures.ExpectEqual(t, schemas, collection.SchemasFor(schema1, schema2))
 }
 
 func TestAggregateStoreMakeValidationFailure(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "broken message name",
-	}})
+	store1 := memory.Make(collection.SchemasFor(schemaFor("SomeConfig", "broken message name")))
 
-	stores := []model.ConfigStore{storeOne}
+	stores := []model.ConfigStore{store1}
 
 	store, err := aggregate.Make(stores)
-	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("cannot discover proto message type")))
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("proto message not found")))
 	g.Expect(store).To(gomega.BeNil())
 }
 
 func TestAggregateStoreGet(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeTwo := &fakes.ConfigStoreCache{}
-
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.DestinationRule",
-	}})
+	store1 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Gatewayclasses))
+	store2 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Gatewayclasses))
 
 	configReturn := &model.Config{
 		ConfigMeta: model.ConfigMeta{
-			Type: "some-config",
-			Name: "other",
+			GroupVersionKind: collections.K8SServiceApisV1Alpha1Gatewayclasses.Resource().GroupVersionKind(),
+			Name:             "other",
 		},
 	}
 
-	storeOne.GetReturns(configReturn)
+	store1.Create(*configReturn)
 
-	stores := []model.ConfigStore{storeOne, storeTwo}
+	stores := []model.ConfigStore{store1, store2}
 
 	store, err := aggregate.Make(stores)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
-	c := store.Get("some-config", "other", "")
-	g.Expect(c).To(gomega.Equal(configReturn))
+	c := store.Get(collections.K8SServiceApisV1Alpha1Gatewayclasses.Resource().GroupVersionKind(), "other", "")
+	g.Expect(c.Name).To(gomega.Equal(configReturn.Name))
 }
 
 func TestAggregateStoreList(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeTwo := &fakes.ConfigStoreCache{}
+	store1 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+	store2 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
 
-	storeTwo.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.Gateway",
-	}})
-
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.DestinationRule",
-	}})
-
-	storeOne.ListReturns([]model.Config{
-		{
-			ConfigMeta: model.ConfigMeta{
-				Type: "some-config",
-				Name: "other",
-			},
+	if _, err := store1.Create(model.Config{
+		ConfigMeta: model.ConfigMeta{
+			GroupVersionKind: collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(),
+			Name:             "other",
 		},
-	}, nil)
-	storeTwo.ListReturns([]model.Config{
-		{
-			ConfigMeta: model.ConfigMeta{
-				Type: "some-config",
-				Name: "another",
-			},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store2.Create(model.Config{
+		ConfigMeta: model.ConfigMeta{
+			GroupVersionKind: collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(),
+			Name:             "another",
 		},
-	}, nil)
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	stores := []model.ConfigStore{storeOne, storeTwo}
+	stores := []model.ConfigStore{store1, store2}
 
 	store, err := aggregate.Make(stores)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
-	l, err := store.List("some-config", "")
+	l, err := store.List(collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(), "")
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(l).To(gomega.HaveLen(2))
 }
@@ -159,14 +123,9 @@ func TestAggregateStoreList(t *testing.T) {
 func TestAggregateStoreFails(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "other-config",
-		Plural:      "other-configs",
-		MessageName: "istio.networking.v1alpha3.Gateway",
-	}})
+	store1 := memory.Make(collection.SchemasFor(schemaFor("OtherConfig", "istio.networking.v1alpha3.Gateway")))
 
-	stores := []model.ConfigStore{storeOne}
+	stores := []model.ConfigStore{store1}
 
 	store, err := aggregate.Make(stores)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
@@ -174,7 +133,7 @@ func TestAggregateStoreFails(t *testing.T) {
 	t.Run("Fails to Delete", func(t *testing.T) {
 		g := gomega.NewGomegaWithT(t)
 
-		err = store.Delete("not", "gonna", "work")
+		err = store.Delete(resource.GroupVersionKind{Kind: "not"}, "gonna", "work")
 		g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("unsupported operation")))
 	})
 
@@ -196,56 +155,52 @@ func TestAggregateStoreFails(t *testing.T) {
 }
 
 func TestAggregateStoreCache(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	stop := make(chan struct{})
+	defer func() { close(stop) }()
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeTwo := &fakes.ConfigStoreCache{}
+	store1 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Httproutes))
+	controller1 := memory.NewController(store1)
+	go controller1.Run(stop)
 
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.DestinationRule",
-	}})
+	store2 := memory.Make(collection.SchemasFor(collections.K8SServiceApisV1Alpha1Gatewayclasses))
+	controller2 := memory.NewController(store2)
+	go controller2.Run(stop)
 
-	storeTwo.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "other-config",
-		Plural:      "other-configs",
-		MessageName: "istio.networking.v1alpha3.Gateway",
-	}})
-
-	stores := []model.ConfigStoreCache{storeOne, storeTwo}
+	stores := []model.ConfigStoreCache{controller1, controller2}
 
 	cacheStore, err := aggregate.MakeCache(stores)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
-
-	t.Run("it checks sync status", func(t *testing.T) {
-		g := gomega.NewGomegaWithT(t)
-
-		syncStatusCases := []struct {
-			storeOne bool
-			storeTwo bool
-			expect   bool
-		}{
-			{true, true, true},
-			{false, true, false},
-			{true, false, false},
-			{false, false, false},
-		}
-		for _, syncStatus := range syncStatusCases {
-			storeOne.HasSyncedReturns(syncStatus.storeOne)
-			storeTwo.HasSyncedReturns(syncStatus.storeTwo)
-			ss := cacheStore.HasSynced()
-			g.Expect(ss).To(gomega.Equal(syncStatus.expect))
-		}
-	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("it registers an event handler", func(t *testing.T) {
-		g := gomega.NewGomegaWithT(t)
+		handled := atomic.NewBool(false)
+		cacheStore.RegisterEventHandler(collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(), func(model.Config, model.Config, model.Event) {
+			handled.Store(true)
+		})
 
-		cacheStore.RegisterEventHandler("some-config", func(model.Config, model.Event) {})
-
-		typ, h := storeOne.RegisterEventHandlerArgsForCall(0)
-		g.Expect(typ).To(gomega.Equal("some-config"))
-		g.Expect(h).ToNot(gomega.BeNil())
+		controller1.Create(model.Config{
+			ConfigMeta: model.ConfigMeta{
+				GroupVersionKind: collections.K8SServiceApisV1Alpha1Httproutes.Resource().GroupVersionKind(),
+				Name:             "another",
+			},
+		})
+		retry.UntilSuccessOrFail(t, func() error {
+			if !handled.Load() {
+				return fmt.Errorf("not handled")
+			}
+			return nil
+		}, retry.Timeout(time.Second))
 	})
+}
+
+func schemaFor(kind, proto string) collection.Schema {
+	return collection.Builder{
+		Name: strings.ToLower(kind),
+		Resource: resource.Builder{
+			Kind:   kind,
+			Plural: strings.ToLower(kind) + "s",
+			Proto:  proto,
+		}.BuildNoValidate(),
+	}.MustBuild()
 }

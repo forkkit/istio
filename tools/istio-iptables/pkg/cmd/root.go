@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,19 @@
 package cmd
 
 import (
+	"fmt"
+	"net"
 	"os"
+	"os/user"
+	"strconv"
 	"strings"
+
+	"istio.io/istio/tools/istio-iptables/pkg/validation"
 
 	"istio.io/istio/tools/istio-iptables/pkg/config"
 	"istio.io/istio/tools/istio-iptables/pkg/constants"
+	dep "istio.io/istio/tools/istio-iptables/pkg/dependencies"
+	"istio.io/pkg/env"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -27,17 +35,53 @@ import (
 	"istio.io/pkg/log"
 )
 
+var (
+	envoyUserVar = env.RegisterStringVar(constants.EnvoyUser, "istio-proxy", "Envoy proxy username")
+	// Enable interception of DNS.
+	// Will be moved to mesh config after it's stable.
+	// TODO: this captures everything, if we want to split cluster.local to TLS and
+	// keep using plain UDP for the rest - we'll need to add another rule to allow
+	// istio-proxy to send.
+	dnsVar = env.RegisterStringVar("DNS_CAPTURE", "",
+		"If set, enable the capture of outgoing DNS packets on port 53, redirecting to :15013")
+)
+
 var rootCmd = &cobra.Command{
-	Use:  "istio-iptables",
-	Long: "Script responsible for setting up port forwarding for Istio sidecar.",
+	Use:   "istio-iptables",
+	Short: "Set up iptables rules for Istio Sidecar",
+	Long:  "Script responsible for setting up port forwarding for Istio sidecar.",
 	Run: func(cmd *cobra.Command, args []string) {
-		config := constructConfig()
-		run(config)
+		cfg := constructConfig()
+		var ext dep.Dependencies
+		if cfg.DryRun {
+			ext = &dep.StdoutStubDependencies{}
+		} else {
+			ext = &dep.RealDependencies{}
+		}
+
+		iptConfigurator := NewIptablesConfigurator(cfg, ext)
+		if !cfg.SkipRuleApply {
+			iptConfigurator.run()
+		}
+		if cfg.RunValidation {
+			hostIP, err := getLocalIP()
+			if err != nil {
+				// Assume it is not handled by istio-cni and won't reuse the ValidationErrorCode
+				panic(err)
+			}
+			validator := validation.NewValidator(cfg, hostIP)
+
+			if validator.Run() != nil {
+				os.Exit(constants.ValidationErrorCode)
+			}
+		}
 	},
 }
 
 func constructConfig() *config.Config {
-	return &config.Config{
+	cfg := &config.Config{
+		DryRun:                  viper.GetBool(constants.DryRun),
+		RestoreFormat:           viper.GetBool(constants.RestoreFormat),
 		ProxyPort:               viper.GetString(constants.EnvoyPort),
 		InboundCapturePort:      viper.GetString(constants.InboundCapturePort),
 		ProxyUID:                viper.GetString(constants.ProxyUID),
@@ -47,14 +91,59 @@ func constructConfig() *config.Config {
 		InboundTProxyRouteTable: viper.GetString(constants.InboundTProxyRouteTable),
 		InboundPortsInclude:     viper.GetString(constants.InboundPorts),
 		InboundPortsExclude:     viper.GetString(constants.LocalExcludePorts),
+		OutboundPortsInclude:    viper.GetString(constants.OutboundPorts),
 		OutboundPortsExclude:    viper.GetString(constants.LocalOutboundPortsExclude),
 		OutboundIPRangesInclude: viper.GetString(constants.ServiceCidr),
 		OutboundIPRangesExclude: viper.GetString(constants.ServiceExcludeCidr),
 		KubevirtInterfaces:      viper.GetString(constants.KubeVirtInterfaces),
-		DryRun:                  viper.GetBool(constants.DryRun),
-		EnableInboundIPv6s:      nil,
-		Clean:                   viper.GetBool(constants.Clean),
+		IptablesProbePort:       uint16(viper.GetUint(constants.IptablesProbePort)),
+		ProbeTimeout:            viper.GetDuration(constants.ProbeTimeout),
+		SkipRuleApply:           viper.GetBool(constants.SkipRuleApply),
+		RunValidation:           viper.GetBool(constants.RunValidation),
 	}
+
+	// TODO: Make this more configurable, maybe with a whitelist of users to be captured for output instead of a blacklist.
+	if cfg.ProxyUID == "" {
+		usr, err := user.Lookup(envoyUserVar.Get())
+		var userID string
+		// Default to the UID of ENVOY_USER and root
+		if err != nil {
+			userID = constants.DefaultProxyUID
+		} else {
+			userID = usr.Uid
+		}
+		// If ENVOY_UID is not explicitly defined (as it would be in k8s env), we add root to the list
+		// for the CA agent.
+		cfg.ProxyUID = userID + ",0"
+	}
+	// For TPROXY as its uid and gid are same.
+	if cfg.ProxyGID == "" {
+		cfg.ProxyGID = cfg.ProxyUID
+	}
+
+	// Detect whether IPv6 is enabled by checking if the pod's IP address is IPv4 or IPv6.
+	podIP, err := getLocalIP()
+	if err != nil {
+		panic(err)
+	}
+	cfg.EnableInboundIPv6 = podIP.To4() == nil
+
+	return cfg
+}
+
+// getLocalIP returns the local IP address
+func getLocalIP() (net.IP, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			return ipnet.IP, nil
+		}
+	}
+	return nil, fmt.Errorf("no valid local IP address found")
 }
 
 func handleError(err error) {
@@ -137,6 +226,13 @@ func init() {
 	}
 	viper.SetDefault(constants.ServiceExcludeCidr, "")
 
+	rootCmd.Flags().StringP(constants.OutboundPorts, "q", "",
+		"Comma separated list of outbound ports to be explicitly included for redirection to Envoy")
+	if err := viper.BindPFlag(constants.OutboundPorts, rootCmd.Flags().Lookup(constants.OutboundPorts)); err != nil {
+		handleError(err)
+	}
+	viper.SetDefault(constants.OutboundPorts, "")
+
 	rootCmd.Flags().StringP(constants.LocalOutboundPortsExclude, "o", "",
 		"Comma separated list of outbound ports to be excluded from redirection to Envoy")
 	if err := viper.BindPFlag(constants.LocalOutboundPortsExclude, rootCmd.Flags().Lookup(constants.LocalOutboundPortsExclude)); err != nil {
@@ -163,17 +259,45 @@ func init() {
 	}
 	viper.SetDefault(constants.InboundTProxyRouteTable, "133")
 
-	rootCmd.Flags().BoolP(constants.DryRun, "n", true, "Do not call any external dependencies like iptables")
+	rootCmd.Flags().BoolP(constants.DryRun, "n", false, "Do not call any external dependencies like iptables")
 	if err := viper.BindPFlag(constants.DryRun, rootCmd.Flags().Lookup(constants.DryRun)); err != nil {
 		handleError(err)
 	}
 	viper.SetDefault(constants.DryRun, false)
 
-	rootCmd.Flags().Bool(constants.Clean, false, "only clean iptables rules")
-	if err := viper.BindPFlag(constants.Clean, rootCmd.Flags().Lookup(constants.Clean)); err != nil {
+	rootCmd.Flags().BoolP(constants.RestoreFormat, "f", true, "Print iptables rules in iptables-restore interpretable format")
+	if err := viper.BindPFlag(constants.RestoreFormat, rootCmd.Flags().Lookup(constants.RestoreFormat)); err != nil {
 		handleError(err)
 	}
-	viper.SetDefault(constants.Clean, false)
+	viper.SetDefault(constants.RestoreFormat, true)
+
+	rootCmd.Flags().String(constants.IptablesProbePort, strconv.Itoa(constants.DefaultIptablesProbePort), "set listen port for failure detection")
+	if err := viper.BindPFlag(constants.IptablesProbePort, rootCmd.Flags().Lookup(constants.IptablesProbePort)); err != nil {
+		handleError(err)
+	}
+	viper.SetDefault(constants.IptablesProbePort, strconv.Itoa(constants.DefaultIptablesProbePort))
+
+	rootCmd.Flags().Duration(constants.ProbeTimeout, constants.DefaultProbeTimeout, "failure detection timeout")
+	if err := viper.BindPFlag(constants.ProbeTimeout, rootCmd.Flags().Lookup(constants.ProbeTimeout)); err != nil {
+		handleError(err)
+	}
+	viper.SetDefault(constants.ProbeTimeout, constants.DefaultProbeTimeout)
+
+	rootCmd.Flags().Bool(constants.SkipRuleApply, false, "Skip iptables apply")
+	if err := viper.BindPFlag(constants.SkipRuleApply, rootCmd.Flags().Lookup(constants.SkipRuleApply)); err != nil {
+		handleError(err)
+	}
+	viper.SetDefault(constants.SkipRuleApply, false)
+
+	rootCmd.Flags().Bool(constants.RunValidation, false, "Validate iptables")
+	if err := viper.BindPFlag(constants.RunValidation, rootCmd.Flags().Lookup(constants.RunValidation)); err != nil {
+		handleError(err)
+	}
+	viper.SetDefault(constants.RunValidation, false)
+}
+
+func GetCommand() *cobra.Command {
+	return rootCmd
 }
 
 func Execute() {

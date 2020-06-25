@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,21 @@
 package client_test
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"testing"
 
-	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	auth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	listener "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
-	route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
-	hcm "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
+	corev2 "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	auth "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
-	"github.com/envoyproxy/go-control-plane/pkg/cache"
-	xds "github.com/envoyproxy/go-control-plane/pkg/server"
+	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
+	"github.com/envoyproxy/go-control-plane/pkg/cache/v2"
+	xds "github.com/envoyproxy/go-control-plane/pkg/server/v2"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 
 	"google.golang.org/grpc"
@@ -36,6 +38,7 @@ import (
 
 	"istio.io/istio/mixer/test/client/env"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/plugin"
 	"istio.io/istio/pilot/pkg/networking/plugin/mixer"
 	pilotutil "istio.io/istio/pilot/pkg/networking/util"
@@ -285,7 +288,7 @@ func TestPilotPlugin(t *testing.T) {
 
 	snapshots := cache.NewSnapshotCache(true, mock{}, nil)
 	_ = snapshots.SetSnapshot(id, makeSnapshot(s, t))
-	server := xds.NewServer(snapshots, nil)
+	server := xds.NewServer(context.Background(), snapshots, nil)
 	discovery.RegisterAggregatedDiscoveryServiceServer(grpcServer, server)
 	go func() {
 		_ = grpcServer.Serve(lis)
@@ -310,7 +313,7 @@ func TestPilotPlugin(t *testing.T) {
 
 type mock struct{}
 
-func (mock) ID(*core.Node) string {
+func (mock) ID(*corev2.Node) string {
 	return id
 }
 func (mock) GetProxyServiceInstances(_ *model.Proxy) ([]*model.ServiceInstance, error) {
@@ -323,9 +326,7 @@ func (mock) GetService(_ host.Name) (*model.Service, error) { return nil, nil }
 func (mock) InstancesByPort(_ *model.Service, _ int, _ labels.Collection) ([]*model.ServiceInstance, error) {
 	return nil, nil
 }
-func (mock) ManagementPorts(_ string) model.PortList                        { return nil }
 func (mock) Services() ([]*model.Service, error)                            { return nil, nil }
-func (mock) WorkloadHealthCheckInfo(_ string) model.ProbeList               { return nil }
 func (mock) GetIstioServiceAccounts(_ *model.Service, ports []int) []string { return nil }
 
 const (
@@ -341,7 +342,12 @@ var (
 			UID:       "istio://ns3/services/svc",
 		},
 	}
-	mesh = &model.Environment{
+	pushContext = model.PushContext{
+		ServiceByHostnameAndNamespace: map[host.Name]map[string]*model.Service{
+			host.Name("svc.ns3"): {
+				"ns3": &svc,
+			},
+		},
 		Mesh: &meshconfig.MeshConfig{
 			MixerCheckServer:            "mixer_server:9091",
 			MixerReportServer:           "mixer_server:9091",
@@ -349,16 +355,8 @@ var (
 		},
 		ServiceDiscovery: mock{},
 	}
-	pushContext = model.PushContext{
-		ServiceByHostnameAndNamespace: map[host.Name]map[string]*model.Service{
-			host.Name("svc.ns3"): {
-				"ns3": &svc,
-			},
-		},
-	}
 	serverParams = plugin.InputParams{
-		ListenerProtocol: plugin.ListenerProtocolHTTP,
-		Env:              mesh,
+		ListenerProtocol: networking.ListenerProtocolHTTP,
 		Node: &model.Proxy{
 			ID:       "pod1.ns2",
 			Type:     model.SidecarProxy,
@@ -368,8 +366,7 @@ var (
 		Push:            &pushContext,
 	}
 	clientParams = plugin.InputParams{
-		ListenerProtocol: plugin.ListenerProtocolHTTP,
-		Env:              mesh,
+		ListenerProtocol: networking.ListenerProtocolHTTP,
 		Node: &model.Proxy{
 			ID:       "pod2.ns2",
 			Type:     model.SidecarProxy,
@@ -380,8 +377,8 @@ var (
 	}
 )
 
-func makeRoute(cluster string) *v2.RouteConfiguration {
-	return &v2.RouteConfiguration{
+func makeRoute(cluster string) *route.RouteConfiguration {
+	return &route.RouteConfiguration{
 		Name: cluster,
 		VirtualHosts: []*route.VirtualHost{{
 			Name:    cluster,
@@ -396,8 +393,8 @@ func makeRoute(cluster string) *v2.RouteConfiguration {
 	}
 }
 
-func makeListener(port uint16, route string) (*v2.Listener, *hcm.HttpConnectionManager) {
-	return &v2.Listener{
+func makeListener(port uint16, route string) (*listener.Listener, *hcm.HttpConnectionManager) {
+	return &listener.Listener{
 			Name: route,
 			Address: &core.Address{Address: &core.Address_SocketAddress{SocketAddress: &core.SocketAddress{
 				Address:       "127.0.0.1",
@@ -425,48 +422,51 @@ func makeSnapshot(s *env.TestSetup, t *testing.T) cache.Snapshot {
 
 	p := mixer.NewPlugin()
 
-	serverMutable := plugin.MutableObjects{Listener: serverListener, FilterChains: []plugin.FilterChain{{}}}
+	serverMutable := networking.MutableObjects{Listener: serverListener, FilterChains: []networking.FilterChain{{}}}
 	if err := p.OnInboundListener(&serverParams, &serverMutable); err != nil {
 		t.Error(err)
 	}
 	serverManager.HttpFilters = append(serverMutable.FilterChains[0].HTTP, serverManager.HttpFilters...)
 	serverListener.FilterChains = []*listener.FilterChain{{
 		Filters: []*listener.Filter{{
-			Name:       wellknown.HTTPConnectionManager,
+			Name:       "http",
 			ConfigType: &listener.Filter_TypedConfig{TypedConfig: pilotutil.MessageToAny(serverManager)},
 		}},
 		// turn on mTLS on downstream
-		TlsContext: &auth.DownstreamTlsContext{
-			CommonTlsContext: &auth.CommonTlsContext{
-				TlsCertificates: []*auth.TlsCertificate{{
-					CertificateChain: &core.DataSource{Specifier: &core.DataSource_Filename{Filename: "testdata/server.cert"}},
-					PrivateKey:       &core.DataSource{Specifier: &core.DataSource_Filename{Filename: "testdata/server-key.cert"}},
-				}},
-				ValidationContextType: &auth.CommonTlsContext_ValidationContext{
-					ValidationContext: &auth.CertificateValidationContext{
-						TrustedCa: &core.DataSource{Specifier: &core.DataSource_Filename{Filename: "testdata/root.cert"}},
+		TransportSocket: &core.TransportSocket{
+			Name: wellknown.TransportSocketTls,
+			ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: pilotutil.MessageToAny(&auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					TlsCertificates: []*auth.TlsCertificate{{
+						CertificateChain: &core.DataSource{Specifier: &core.DataSource_Filename{Filename: "testdata/server.cert"}},
+						PrivateKey:       &core.DataSource{Specifier: &core.DataSource_Filename{Filename: "testdata/server-key.cert"}},
+					}},
+					ValidationContextType: &auth.CommonTlsContext_ValidationContext{
+						ValidationContext: &auth.CertificateValidationContext{
+							TrustedCa: &core.DataSource{Specifier: &core.DataSource_Filename{Filename: "testdata/root.cert"}},
+						},
 					},
 				},
-			},
-			RequireClientCertificate: proto.BoolTrue,
+				RequireClientCertificate: proto.BoolTrue,
+			})},
 		},
 	}}
 
-	clientMutable := plugin.MutableObjects{Listener: clientListener, FilterChains: []plugin.FilterChain{{}}}
+	clientMutable := networking.MutableObjects{Listener: clientListener, FilterChains: []networking.FilterChain{{}}}
 	if err := p.OnOutboundListener(&clientParams, &clientMutable); err != nil {
 		t.Error(err)
 	}
 	clientManager.HttpFilters = append(clientMutable.FilterChains[0].HTTP, clientManager.HttpFilters...)
 	clientListener.FilterChains = []*listener.FilterChain{{Filters: []*listener.Filter{{
-		Name:       wellknown.HTTPConnectionManager,
+		Name:       "http",
 		ConfigType: &listener.Filter_TypedConfig{TypedConfig: pilotutil.MessageToAny(clientManager)},
 	}}}}
 
 	p.OnInboundRouteConfiguration(&serverParams, serverRoute)
 	p.OnOutboundRouteConfiguration(&clientParams, clientRoute)
 
-	return cache.Snapshot{
-		Routes:    cache.NewResources("http", []cache.Resource{clientRoute, serverRoute}),
-		Listeners: cache.NewResources("http", []cache.Resource{clientListener, serverListener}),
-	}
+	snapshot := cache.Snapshot{}
+	snapshot.Resources[types.Route] = cache.NewResources("http", []types.Resource{env.CastRouteToV2(clientRoute), env.CastRouteToV2(serverRoute)})
+	snapshot.Resources[types.Listener] = cache.NewResources("http", []types.Resource{env.CastListenerToV2(clientListener), env.CastListenerToV2(serverListener)})
+	return snapshot
 }

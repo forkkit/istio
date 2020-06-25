@@ -1,4 +1,4 @@
-//  Copyright 2019 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package framework
 import (
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 
 	"github.com/hashicorp/go-multierror"
@@ -69,6 +70,43 @@ func (s *scope) add(r resource.Resource, id *resourceID) {
 	}
 }
 
+func (s *scope) get(ref interface{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	refVal := reflect.ValueOf(ref)
+	if refVal.Kind() != reflect.Ptr {
+		return fmt.Errorf("ref must be a pointer instead got: %T", ref)
+	}
+	// work with the underlying value rather than the pointer
+	refVal = refVal.Elem()
+
+	targetT := refVal.Type()
+	if refVal.Kind() == reflect.Slice {
+		// for slices look at the element type
+		targetT = targetT.Elem()
+	}
+
+	target := fmt.Sprintf("%v", targetT)
+	fmt.Printf("target: %s\n", target)
+	for _, res := range s.resources {
+		if res == nil {
+			continue
+		}
+		resVal := reflect.ValueOf(res)
+		if resVal.Type().AssignableTo(targetT) {
+			if refVal.Kind() == reflect.Slice {
+				refVal.Set(reflect.Append(refVal, resVal))
+			} else {
+				refVal.Set(resVal)
+				return nil
+			}
+		}
+	}
+
+	return nil
+}
+
 func (s *scope) addCloser(c io.Closer) {
 	s.closers = append(s.closers, c)
 }
@@ -101,7 +139,7 @@ func (s *scope) done(nocleanup bool) error {
 			scopes.Framework.Debugf("Begin cleaning up %s", name)
 			if e := c.Close(); e != nil {
 				scopes.Framework.Debugf("Error cleaning up %s: %v", name, e)
-				err = multierror.Append(e, err)
+				err = multierror.Append(err, e)
 			}
 			scopes.Framework.Debugf("Cleanup complete for %s", name)
 		}

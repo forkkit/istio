@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -108,7 +108,6 @@ func (du *dedupUtil) reapDedup() {
 		du.logger.Debugf("Running repear to reclaim %d old deduplication entries", len(t))
 	}
 
-	// TODO: why isn't there a O(1) way to clear a map to the empty state?!
 	for k := range t {
 		delete(t, k)
 	}

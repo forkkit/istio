@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -126,11 +126,13 @@ type Stream interface {
 // Source implements the resource source message exchange for MCP.
 // It can be instantiated by client and server
 type Source struct {
+	// nextStreamID and connections must be at start of struct to ensure 64bit alignment for atomics on
+	// 32bit architectures. See also: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+	nextStreamID   int64
+	connections    int64
 	watcher        Watcher
 	collections    []CollectionOptions
-	nextStreamID   int64
 	reporter       monitoring.Reporter
-	connections    int64
 	requestLimiter rate.LimitFactory
 }
 
@@ -340,7 +342,7 @@ func (con *connection) pushServerResponse(w *watch, resp *WatchResponse) error {
 		Collection:        resp.Collection,
 		Resources:         added,
 		RemovedResources:  removed,
-		Incremental:       incremental,
+		Incremental:       con.streamNonce > 0 && incremental, // the first response was not consider as incremental
 	}
 
 	// increment nonce

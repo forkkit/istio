@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@ package inject
 
 import (
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -27,38 +26,34 @@ import (
 	"strings"
 	"testing"
 
-	"k8s.io/helm/pkg/strvals"
-
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/ghodss/yaml"
 	"github.com/gogo/protobuf/jsonpb"
-	"github.com/onsi/gomega"
-
-	"istio.io/api/annotation"
-
-	"istio.io/istio/pilot/test/util"
-	"istio.io/istio/pkg/config/mesh"
-	"istio.io/istio/pkg/mcp/testing/testcerts"
-
+	"github.com/gogo/protobuf/types"
 	"k8s.io/api/admission/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/helm/pkg/chartutil"
-	"k8s.io/helm/pkg/engine"
-	"k8s.io/helm/pkg/proto/hapi/chart"
-	tversion "k8s.io/helm/pkg/proto/hapi/version"
-	"k8s.io/helm/pkg/timeconv"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
+
+	"istio.io/api/annotation"
+	meshconfig "istio.io/api/mesh/v1alpha1"
+	operatormesh "istio.io/istio/operator/cmd/mesh"
+	"istio.io/istio/operator/pkg/name"
+	"istio.io/istio/operator/pkg/util/clog"
+	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/config/mesh"
 )
 
-const (
-	helmChartDirectory     = "../../../install/kubernetes/helm/istio"
-	helmConfigMapKey       = "istio/templates/sidecar-injector-configmap.yaml"
-	injectorConfig         = "../../../install/kubernetes/helm/istio/files/injection-template.yaml"
-	helmValuesFile         = "values.yaml"
-	yamlSeparator          = "\n---"
-	minimalSidecarTemplate = `
+const yamlSeparator = "\n---"
+
+var minimalSidecarTemplate = &Config{
+	Policy: InjectionPolicyEnabled,
+	Template: `
 initContainers:
 - name: istio-init
 containers:
@@ -67,59 +62,8 @@ volumes:
 - name: istio-envoy
 imagePullSecrets:
 - name: istio-image-pull-secrets
-`
-)
-
-var (
-	rotatedKey = []byte(`-----BEGIN RSA PRIVATE KEY-----
-MIIEpAIBAAKCAQEA3Tr24CaBegyfkdDGWckqMHEWvpJBThjXlMz/FKcg1bgq57OD
-oNHXN4dcyPCHWWEY3Eo3YG1es4pqTkvzK0+1JoY6/K88Lu1ePj5PeSFuWfPWi1BW
-9oyWJW+AAzqqGkZmSo4z26N+E7N8ht5bTBMNVD3jqz9+MaqCTVmQ6dAgdFKH07wd
-XWh6kKoh2g9bgBKB+qWrezmVRb31i93sM1pJos35cUmIbWgiSQYuSXEInitejcGZ
-cBjqRy61SiZB7nbmMoew0G0aGXe20Wx+QiyJjbt9XNUm0IvjAJ1SSiPqfFQ4F+tx
-K4q3xAwp1smyiMv57RNC2ny8YMntZYgQDDkhBQIDAQABAoIBAQDZHK396yw0WEEd
-vFN8+CRUaBfXLPe0KkMgAFLxtNdPhy9sNsueP3HESC7x8MQUHmtkfd1837kJ4HRV
-pMnfnpj8Vs17AIrCzycnVMVv7jQ7SUcrb8v4qJ4N3TA3exJHOQHYd1hDXF81/Hbg
-cUYOEcCKBTby8BvrqBe6y4ShQiUnoaeeM5j9x32+QB652/9PMuZJ9xfwyoEBjoVA
-cccp+u3oBX864ztaG9Gn0wbgRVeafsPfuAOUmShykohV1mVJddiA0wayxGi0TmoK
-dwrltdToI7BmpmmTLc59O44JFGwO67aJQHsrHBjEnpWlxFDwbfZuf93FgdFUFFjr
-tVx2dPF9AoGBAPkIaUYxMSW78MD9862eJlGS6F/SBfPLTve3l9M+UFnEsWapNz+V
-anlupaBtlfRJxLDzjheMVZTv/TaFIrrMdN/xc/NoYj6lw5RV8PEfKPB0FjSAqSEl
-iVOA5q4kuI1xEeV7xLE4uJUF3wdoHz9cSmjrXDVZXq/KsaInABlAl1xjAoGBAONr
-bgFUlQ+fbsGNjeefrIXBSU93cDo5tkd4+lefrmUVTwCo5V/AvMMQi88gV/sz6qCJ
-gR0hXOqdQyn++cuqfMTDj4lediDGFEPho+n4ToIvkA020NQ05cKxcmn/6Ei+P9pk
-v+zoT9RiVnkBje2n/KU2d/PEL9Nl4gvvAgPLt8V3AoGAZ6JZdQ15n3Nj0FyecKz0
-01Oogl+7fGYqGap8cztmYsUY8lkPFdXPNnOWV3njQoMEaIMiqagL4Wwx2uNyvXvi
-U2N+1lelMt720h8loqJN/irBJt44BARD7s0gsm2zo6DfSrnD8+Bf6BxGYSWyg0Kb
-8KepesYTQmK+o3VJdDjOBHMCgYAIxbwYkQqu75d2H9+5b49YGXyadCEAHfnKCACg
-IKi5fXjurZUrfGPLonfCJZ0/M2F5j9RLK15KLobIt+0qzgjCDkkbI2mrGfjuJWYN
-QGbG3s7Ps62age/a8r1XGWf8ZlpQMlK08MEjkCeFw2mWIUS9mrxFyuuNXAC8NRv+
-yXztQQKBgQDWTFFQdeYfuiKHrNmgOmLVuk1WhAaDgsdK8RrnNZgJX9bd7n7bm7No
-GheN946AYsFge4DX7o0UXXJ3h5hTFn/hSWASI54cO6WyWNEiaP5HRlZqK7Jfej7L
-mz+dlU3j/BY19RLmYeg4jFV4W66CnkDqpneOJs5WdmFFoWnHn7gRBw==
------END RSA PRIVATE KEY-----`)
-
-	// ServerCert is a test cert for dynamic admission controller.
-	rotatedCert = []byte(`-----BEGIN CERTIFICATE-----
-MIIDATCCAemgAwIBAgIJAJwGb32Zn8sDMA0GCSqGSIb3DQEBCwUAMA4xDDAKBgNV
-BAMMA19jYTAgFw0xODAzMTYxNzI0NDJaGA8yMjkxMTIzMDE3MjQ0MlowEjEQMA4G
-A1UEAwwHX3NlcnZlcjCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAN06
-9uAmgXoMn5HQxlnJKjBxFr6SQU4Y15TM/xSnINW4Kuezg6DR1zeHXMjwh1lhGNxK
-N2BtXrOKak5L8ytPtSaGOvyvPC7tXj4+T3khblnz1otQVvaMliVvgAM6qhpGZkqO
-M9ujfhOzfIbeW0wTDVQ946s/fjGqgk1ZkOnQIHRSh9O8HV1oepCqIdoPW4ASgfql
-q3s5lUW99Yvd7DNaSaLN+XFJiG1oIkkGLklxCJ4rXo3BmXAY6kcutUomQe525jKH
-sNBtGhl3ttFsfkIsiY27fVzVJtCL4wCdUkoj6nxUOBfrcSuKt8QMKdbJsojL+e0T
-Qtp8vGDJ7WWIEAw5IQUCAwEAAaNcMFowCQYDVR0TBAIwADALBgNVHQ8EBAMCBeAw
-HQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMCEGA1UdEQQaMBiHBH8AAAGH
-EAAAAAAAAAAAAAAAAAAAAAEwDQYJKoZIhvcNAQELBQADggEBACbBlWo/pY/OIJaW
-RwkfSRVzEIWpHt5OF6p93xfyy4/zVwwhH1AQB7Euji8vOaVNOpMfGYLNH3KIRReC
-CIvGEH4yZDbpiH2cOshqMCuV1CMRUTdl4mq6M0PtGm6b8OG3uIFTLIR973LBWOl5
-wCR1yrefT1NHuIScGaBXUGAV4JAx37pfg84hDD73T2j1TDD3Lrmsb9WCP+L26TG6
-ICN61cIhgz8wChQpF8/fFAI5Fjbjrz5C1Xw/EUHLf/TTn/7Yfp2BHsGm126Et+k+
-+MLBzBfrHKwPaGqDvNHUDrI6c3GI0Qp7jW93FbL5ul8JQ+AowoMF2dIEbN9qQEVP
-ZOQ5UvU=
------END CERTIFICATE-----`)
-)
+`,
+}
 
 func parseToLabelSelector(t *testing.T, selector string) *metav1.LabelSelector {
 	result, err := metav1.ParseToLabelSelector(selector)
@@ -549,10 +493,6 @@ func TestWebhookInject(t *testing.T) {
 			wantFile:  "TestWebhookInject_no_volumes_imagePullSecrets.patch",
 		},
 		{
-			inputFile: "TestWebhookInject_no_containers_volumes_imagePullSecrets.yaml",
-			wantFile:  "TestWebhookInject_no_containers_volumes_imagePullSecrets.patch",
-		},
-		{
 			inputFile: "TestWebhookInject_no_containers_volumes.yaml",
 			wantFile:  "TestWebhookInject_no_containers_volumes.patch",
 		},
@@ -634,6 +574,16 @@ func TestWebhookInject(t *testing.T) {
 			inputFile: "TestWebhookInject_mtls_not_ready.yaml",
 			wantFile:  "TestWebhookInject_mtls_not_ready.patch",
 		},
+		{
+			inputFile:    "TestWebhookInject_validationOrder.yaml",
+			wantFile:     "TestWebhookInject_validationOrder.patch",
+			templateFile: "TestWebhookInject_validationOrder_template.yaml",
+		},
+		{
+			inputFile:    "TestWebhookInject_probe_rewrite_timeout_retention.yaml",
+			wantFile:     "TestWebhookInject_probe_rewrite_timeout_retention.patch",
+			templateFile: "TestWebhookInject_probe_rewrite_timeout_retention_template.yaml",
+		},
 	}
 
 	for i, c := range cases {
@@ -643,7 +593,9 @@ func TestWebhookInject(t *testing.T) {
 		if c.templateFile != "" {
 			templateFile = c.templateFile
 		}
+		c := c
 		t.Run(fmt.Sprintf("[%d] %s", i, c.inputFile), func(t *testing.T) {
+			t.Parallel()
 			wh, cleanup := createTestWebhookFromFile(filepath.Join("testdata/webhook", templateFile), t)
 			defer cleanup()
 			podYAML := util.ReadFile(input, t)
@@ -657,7 +609,7 @@ func TestWebhookInject(t *testing.T) {
 						Raw: podJSON,
 					},
 				},
-			})
+			}, "")
 			var prettyPatch bytes.Buffer
 			if err := json.Indent(&prettyPatch, got.Patch, "", "  "); err != nil {
 				t.Fatalf(err.Error())
@@ -726,6 +678,10 @@ func TestHelmInject(t *testing.T) {
 		{
 			inputFile: "deploymentconfig.yaml",
 			wantFile:  "deploymentconfig.yaml.injected",
+		},
+		{
+			inputFile: "deploymentconfig-with-canonical-service-label.yaml",
+			wantFile:  "deploymentconfig-with-canonical-service-label.yaml.injected",
 		},
 		{
 			inputFile: "deploymentconfig-multi.yaml",
@@ -799,7 +755,7 @@ func TestHelmInject(t *testing.T) {
 								Raw: templateJSON,
 							},
 						},
-					})
+					}, "")
 
 					// Apply the generated patch to the template.
 					patch := prettyJSON(got.Patch, t)
@@ -834,7 +790,7 @@ func TestHelmInject(t *testing.T) {
 	}
 }
 
-func createTestWebhook(t testing.TB, configYaml string) (*Webhook, func()) {
+func createTestWebhook(t testing.TB, config *Config, values string) (*Webhook, func()) {
 	m := mesh.DefaultMeshConfig()
 	dir, err := ioutil.TempDir("", "webhook_test")
 	if err != nil {
@@ -843,152 +799,99 @@ func createTestWebhook(t testing.TB, configYaml string) (*Webhook, func()) {
 	cleanup := func() {
 		_ = os.RemoveAll(dir)
 	}
-	config := &Config{}
-	if err := yaml.Unmarshal([]byte(configYaml), config); err != nil {
-		t.Fatalf("failed to read webhook config: %v", err)
-	}
 	return &Webhook{
-		sidecarConfig:          config,
+		Config:                 config,
 		sidecarTemplateVersion: "unit-test-fake-version",
 		meshConfig:             &m,
-		valuesConfig:           getValuesWithHelm(nil, t),
+		valuesConfig:           values,
 	}, cleanup
 }
 
 func createTestWebhookFromFile(templateFile string, t *testing.T) (*Webhook, func()) {
 	t.Helper()
-	sidecarTemplate := string(util.ReadFile(templateFile, t))
-	return createTestWebhook(t, sidecarTemplate)
+	injectConfig := &Config{}
+	if err := yaml.Unmarshal(util.ReadFile(templateFile, t), injectConfig); err != nil {
+		t.Fatalf("failed to unmarshal injectionConfig: %v", err)
+	}
+	return createTestWebhook(t, injectConfig, "{}")
 }
 
 func createTestWebhookFromHelmConfigMap(t *testing.T) (*Webhook, func()) {
 	t.Helper()
 	// Load the config map with Helm. This simulates what will be done at runtime, by replacing function calls and
 	// variables and generating a new configmap for use by the injection logic.
-	sidecarTemplate := loadConfigMapWithHelm(nil, t)
-	return createTestWebhook(t, sidecarTemplate)
+	sidecarTemplate, values, _ := loadInjectionSettings(t, nil, "")
+	return createTestWebhook(t, sidecarTemplate, values)
 }
 
-func loadSidecarTemplate(t testing.TB) string {
-	injectionConfig, err := ioutil.ReadFile(injectorConfig) // nolint: vetshadow
-	if err != nil {
-		t.Fatalf("failed to load sidecar template: %v", err)
-	}
-	return string(injectionConfig)
-}
-
-func getValues(params *Params, t testing.TB) string {
-	values := getHelmValues(t)
-	mergedValues := mergeParamsIntoHelmValues(params, values, t)
-	return mergedValues
-}
-
-func getValuesWithHelm(params *Params, t testing.TB) string {
-	c, err := chartutil.Load(helmChartDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	values := getHelmValues(t)
-	mergedValues := mergeParamsIntoHelmValues(params, values, t)
-	chartConfig := &chart.Config{Raw: mergedValues, Values: map[string]*chart.Value{}}
-
-	vals, err := chartutil.CoalesceValues(c, chartConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, err := vals.YAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out
-}
-
-func loadConfigMapWithHelm(params *Params, t testing.TB) string {
+// loadInjectionSettings will render the charts using the operator, with given yaml overrides.
+// This allows us to fully simulate what will actually happen at run time.
+func loadInjectionSettings(t testing.TB, setFlags []string, inFilePath string) (template *Config, values string, meshConfig *meshconfig.MeshConfig) {
 	t.Helper()
-	c, err := chartutil.Load(helmChartDirectory)
+	// add --set installPackagePath=<path to charts snapshot>
+	setFlags = append(setFlags, "installPackagePath="+defaultInstallPackageDir())
+	var inFilenames []string
+	if inFilePath != "" {
+		inFilenames = []string{"testdata/inject/" + inFilePath}
+	}
+
+	l := clog.NewConsoleLogger(os.Stdout, os.Stderr, nil)
+	manifests, _, err := operatormesh.GenManifests(inFilenames, setFlags, false, nil, l)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to generate manifests: %v", err)
 	}
+	for _, mlist := range manifests[name.PilotComponentName] {
+		for _, object := range strings.Split(mlist, yamlSeparator) {
 
-	values := getHelmValues(t)
-	mergedValues := mergeParamsIntoHelmValues(params, values, t)
+			r := bytes.NewReader([]byte(object))
+			decoder := k8syaml.NewYAMLOrJSONDecoder(r, 1024)
 
-	chartConfig := &chart.Config{Raw: mergedValues, Values: map[string]*chart.Value{}}
-	options := chartutil.ReleaseOptions{
-		Name:      "istio",
-		Time:      timeconv.Now(),
-		Namespace: "",
-	}
-
-	vals, err := chartutil.ToRenderValuesCaps(c, chartConfig, options, &chartutil.Capabilities{TillerVersion: &tversion.Version{SemVer: "2.7.2"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	files, err := engine.New().Render(c, vals)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	f, ok := files[helmConfigMapKey]
-	if !ok {
-		t.Fatalf("Unable to located configmap file %s", helmConfigMapKey)
-	}
-
-	cfgMap := corev1.ConfigMap{}
-	err = yaml.Unmarshal([]byte(f), &cfgMap)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, ok := cfgMap.Data["config"]
-	if !ok {
-		t.Fatal("ConfigMap yaml missing config field")
-	}
-
-	return cfg
-}
-
-func getHelmValues(t testing.TB) string {
-	t.Helper()
-	valuesFile := filepath.Join(helmChartDirectory, helmValuesFile)
-	return string(util.ReadFile(valuesFile, t))
-}
-
-func mergeParamsIntoHelmValues(params *Params, vals string, t testing.TB) string {
-	t.Helper()
-	if params == nil {
-		return vals
-	}
-	valMap := chartutil.FromYaml(vals)
-	paramsVals := params.intoHelmValues()
-	for path, value := range paramsVals {
-		setStr := fmt.Sprintf("%s=%s", path, escapeHelmValue(value))
-		if err := strvals.ParseInto(setStr, valMap); err != nil {
-			t.Fatal(err)
+			out := &unstructured.Unstructured{}
+			err := decoder.Decode(out)
+			if err != nil {
+				t.Fatalf("error decoding object: %v", err)
+			}
+			if out.GetName() == "istio-sidecar-injector" && (out.GroupVersionKind() == schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}) {
+				data, ok := out.Object["data"].(map[string]interface{})
+				if !ok {
+					t.Fatalf("failed to convert %v", out)
+				}
+				config, ok := data["config"].(string)
+				if !ok {
+					t.Fatalf("failed to config %v", data)
+				}
+				values, ok = data["values"].(string)
+				if !ok {
+					t.Fatalf("failed to config %v", data)
+				}
+				template = &Config{}
+				if err := yaml.Unmarshal([]byte(config), template); err != nil {
+					t.Fatalf("failed to unmarshal injectionConfig: %v", err)
+				}
+				if meshConfig != nil {
+					return template, values, meshConfig
+				}
+			} else if out.GetName() == "istio" && (out.GroupVersionKind() == schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}) {
+				data, ok := out.Object["data"].(map[string]interface{})
+				if !ok {
+					t.Fatalf("failed to convert %v", out)
+				}
+				meshdata, ok := data["mesh"].(string)
+				if !ok {
+					t.Fatalf("failed to get meshconfig %v", data)
+				}
+				meshConfig, err = mesh.ApplyMeshConfig(meshdata, mesh.DefaultMeshConfig())
+				if err != nil {
+					t.Fatalf("failed to unmarshal meshconfig: %v", err)
+				}
+				if template != nil {
+					return template, values, meshConfig
+				}
+			}
 		}
 	}
-	return chartutil.ToYaml(valMap)
-}
-
-func escapeHelmValue(val string) string {
-	if len(val) == 0 {
-		return val
-	}
-
-	if val[0] == '{' && val[len(val)-1] == '}' {
-		val := val[1 : len(val)-1]
-		val = strings.Replace(val, "{", "\\{", -1)
-		val = strings.Replace(val, "}", "\\}", -1)
-		val = strings.Replace(val, ".", "\\.", -1)
-		val = strings.Replace(val, "=", "\\=", -1)
-
-		return "{" + val + "}"
-	}
-
-	val = strings.Replace(val, ",", "\\,", -1)
-	val = strings.Replace(val, ".", "\\.", -1)
-	val = strings.Replace(val, "=", "\\=", -1)
-	return val
+	t.Fatal("could not find injection template")
+	return nil, "", nil
 }
 
 func splitYamlFile(yamlFile string, t *testing.T) [][]byte {
@@ -1130,9 +1033,6 @@ func normalizeAndCompareDeployments(got, want *appsv1.Deployment, t *testing.T) 
 	t.Helper()
 	// Scrub unimportant fields that tend to differ.
 	getAnnotations(got)[annotation.SidecarStatus.Name] = getAnnotations(want)[annotation.SidecarStatus.Name]
-	gotIstioCerts := istioCerts(got)
-	wantIstioCerts := istioCerts(want)
-	gotIstioCerts.Secret.DefaultMode = wantIstioCerts.Secret.DefaultMode
 	gotIstioInit := istioInit(got, t)
 	wantIstioInit := istioInit(want, t)
 	gotIstioInit.Image = wantIstioInit.Image
@@ -1181,16 +1081,6 @@ func normalizeAndCompareDeployments(got, want *appsv1.Deployment, t *testing.T) 
 
 func getAnnotations(d *appsv1.Deployment) map[string]string {
 	return d.Spec.Template.ObjectMeta.Annotations
-}
-
-func istioCerts(d *appsv1.Deployment) *corev1.Volume {
-	for i := 0; i < len(d.Spec.Template.Spec.Volumes); i++ {
-		v := &d.Spec.Template.Spec.Volumes[i]
-		if v.Name == "istio-certs" {
-			return v
-		}
-	}
-	return nil
 }
 
 func istioInit(d *appsv1.Deployment, t *testing.T) *corev1.Container {
@@ -1258,7 +1148,7 @@ func makeTestData(t testing.TB, skip bool) []byte {
 	return reviewJSON
 }
 
-func createWebhook(t testing.TB, sidecarTemplate string) (*Webhook, func()) {
+func createWebhook(t testing.TB, cfg *Config) (*Webhook, func()) {
 	t.Helper()
 	dir, err := ioutil.TempDir("", "webhook_test")
 	if err != nil {
@@ -1268,22 +1158,15 @@ func createWebhook(t testing.TB, sidecarTemplate string) (*Webhook, func()) {
 		_ = os.RemoveAll(dir)
 	}
 
-	cfg := &Config{
-		Policy:   InjectionPolicyEnabled,
-		Template: sidecarTemplate,
-	}
 	configBytes, err := yaml.Marshal(cfg)
 	if err != nil {
 		cleanup()
 		t.Fatalf("Could not marshal test injection config: %v", err)
 	}
-	valuesBytes := []byte(getValues(&Params{}, t))
+	_, values, _ := loadInjectionSettings(t, nil, "")
 	var (
 		configFile     = filepath.Join(dir, "config-file.yaml")
 		valuesFile     = filepath.Join(dir, "values-file.yaml")
-		meshFile       = filepath.Join(dir, "mesh-file.yaml")
-		certFile       = filepath.Join(dir, "cert-file.yaml")
-		keyFile        = filepath.Join(dir, "key-file.yaml")
 		port           = 0
 		monitoringPort = 0
 	)
@@ -1293,45 +1176,23 @@ func createWebhook(t testing.TB, sidecarTemplate string) (*Webhook, func()) {
 		t.Fatalf("WriteFile(%v) failed: %v", configFile, err)
 	}
 
-	if err := ioutil.WriteFile(valuesFile, valuesBytes, 0644); err != nil { // nolint: vetshadow
+	if err := ioutil.WriteFile(valuesFile, []byte(values), 0644); err != nil { // nolint: vetshadow
 		cleanup()
 		t.Fatalf("WriteFile(%v) failed: %v", valuesFile, err)
 	}
 
-	// mesh
+	// mesh config
 	m := mesh.DefaultMeshConfig()
-	marshaller := jsonpb.Marshaler{
-		Indent: "  ",
+	env := model.Environment{
+		Watcher: mesh.NewFixedWatcher(&m),
 	}
-	var meshBytes bytes.Buffer
-	if err := marshaller.Marshal(&meshBytes, &m); err != nil { // nolint: vetshadow
-		cleanup()
-		t.Fatalf("yaml.Marshal(mesh) failed: %v", err)
-	}
-	if err := ioutil.WriteFile(meshFile, meshBytes.Bytes(), 0644); err != nil { // nolint: vetshadow
-		cleanup()
-		t.Fatalf("WriteFile(%v) failed: %v", meshFile, err)
-	}
-
-	// cert
-	if err := ioutil.WriteFile(certFile, testcerts.ServerCert, 0644); err != nil { // nolint: vetshadow
-		cleanup()
-		t.Fatalf("WriteFile(%v) failed: %v", certFile, err)
-	}
-	// key
-	if err := ioutil.WriteFile(keyFile, testcerts.ServerKey, 0644); err != nil { // nolint: vetshadow
-		cleanup()
-		t.Fatalf("WriteFile(%v) failed: %v", keyFile, err)
-	}
-
 	wh, err := NewWebhook(WebhookParameters{
 		ConfigFile:     configFile,
 		ValuesFile:     valuesFile,
-		MeshFile:       meshFile,
-		CertFile:       certFile,
-		KeyFile:        keyFile,
 		Port:           port,
 		MonitoringPort: monitoringPort,
+		Env:            &env,
+		Mux:            http.NewServeMux(),
 	})
 	if err != nil {
 		cleanup()
@@ -1341,6 +1202,7 @@ func createWebhook(t testing.TB, sidecarTemplate string) (*Webhook, func()) {
 }
 
 func TestRunAndServe(t *testing.T) {
+	// TODO: adjust the test to match prod defaults instead of fake defaults.
 	wh, cleanup := createWebhook(t, minimalSidecarTemplate)
 	defer cleanup()
 	stop := make(chan struct{})
@@ -1388,18 +1250,55 @@ func TestRunAndServe(t *testing.T) {
    },
    {
       "op":"add",
+      "path":"/spec/securityContext",
+      "value":{
+         "fsGroup":1337
+      }
+   },
+   {
+      "op":"add",
       "path":"/metadata/annotations",
       "value":{
-         "sidecar.istio.io/status":"{\"version\":\"461c380844de8df1d1e2a80a09b6d7b58b8313c4a7d6796530eb124740a1440f\",\"initContainers\":[\"istio-init\"],\"containers\":[\"istio-proxy\"],\"volumes\":[\"istio-envoy\"],\"imagePullSecrets\":[\"istio-image-pull-secrets\"]}"
+         "prometheus.io/path":"/stats/prometheus"
       }
    },
    {
       "op": "add",
-      "path": "/metadata/labels",
-      "value": {
-         "security.istio.io/mtlsReady": "true"
+      "path": "/metadata/annotations/prometheus.io~1port",
+      "value": "15020"
+   },
+   {
+      "op": "add",
+      "path": "/metadata/annotations/prometheus.io~1scrape",
+      "value": "true"
+   },
+   {
+      "op":"add",
+      "path":"/metadata/annotations/sidecar.istio.io~1status",
+      "value": "{\"version\":\"461c380844de8df1d1e2a80a09b6d7b58b8313c4a7d6796530eb124740a1440f\",\"initContainers\":[\"istio-init\"],\"containers\":[\"istio-proxy\"],\"volumes\":[\"istio-envoy\"],\"imagePullSecrets\":[\"istio-image-pull-secrets\"]}"
+   },
+    {
+      "op":"add",
+      "path":"/metadata/labels",
+      "value":{
+         "istio.io/rev":""
       }
-    }
+    },
+    {
+      "op":"add",
+      "path":"/metadata/labels/security.istio.io~1tlsMode",
+      "value":"istio"
+    },
+    {
+      "op": "add",
+      "path": "/metadata/labels/service.istio.io~1canonical-name",
+      "value": "test"
+	},
+	{
+		"op": "add",
+		"path": "/metadata/labels/service.istio.io~1canonical-revision",
+		"value": "latest"
+	}
 ]`)
 
 	cases := []struct {
@@ -1499,41 +1398,6 @@ func TestRunAndServe(t *testing.T) {
 	testSideCarInjectorMetrics(t, wh)
 }
 
-func TestReloadCert(t *testing.T) {
-	wh, cleanup := createWebhook(t, minimalSidecarTemplate)
-	defer cleanup()
-	stop := make(chan struct{})
-	defer func() { close(stop) }()
-	go wh.Run(stop)
-	checkCert(t, wh, testcerts.ServerCert, testcerts.ServerKey)
-	// Update cert/key files.
-	if err := ioutil.WriteFile(wh.certFile, rotatedCert, 0644); err != nil { // nolint: vetshadow
-		cleanup()
-		t.Fatalf("WriteFile(%v) failed: %v", wh.certFile, err)
-	}
-	if err := ioutil.WriteFile(wh.keyFile, rotatedKey, 0644); err != nil { // nolint: vetshadow
-		cleanup()
-		t.Fatalf("WriteFile(%v) failed: %v", wh.keyFile, err)
-	}
-	g := gomega.NewGomegaWithT(t)
-	g.Eventually(func() bool {
-		return checkCert(t, wh, rotatedCert, rotatedKey)
-	}, "10s", "100ms").Should(gomega.BeTrue())
-}
-
-func checkCert(t *testing.T, wh *Webhook, cert, key []byte) bool {
-	t.Helper()
-	actual, err := wh.getCert(nil)
-	if err != nil {
-		t.Fatalf("fail to get certificate from webhook: %s", err)
-	}
-	expected, err := tls.X509KeyPair(cert, key)
-	if err != nil {
-		t.Fatalf("fail to load test certs.")
-	}
-	return bytes.Equal(actual.Certificate[0], expected.Certificate[0])
-}
-
 func testSideCarInjectorMetrics(t *testing.T, wh *Webhook) {
 	srv := httptest.NewServer(wh.mon.exporter)
 	defer srv.Close()
@@ -1546,7 +1410,9 @@ func testSideCarInjectorMetrics(t *testing.T, wh *Webhook) {
 	if err != nil {
 		t.Fatalf("failed to read body: %v", err)
 	}
-	resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("failed to close: %v", err)
+	}
 
 	output := string(body)
 
@@ -1568,19 +1434,7 @@ func testSideCarInjectorMetrics(t *testing.T, wh *Webhook) {
 }
 
 func BenchmarkInjectServe(b *testing.B) {
-	mesh := mesh.DefaultMeshConfig()
-	params := &Params{
-		InitImage:           InitImageName(unitTestHub, unitTestTag),
-		ProxyImage:          ProxyImageName(unitTestHub, unitTestTag),
-		ImagePullPolicy:     "IfNotPresent",
-		Verbosity:           DefaultVerbosity,
-		SidecarProxyUID:     DefaultSidecarProxyUID,
-		Version:             "12345678",
-		Mesh:                &mesh,
-		IncludeIPRanges:     DefaultIncludeIPRanges,
-		IncludeInboundPorts: DefaultIncludeInboundPorts,
-	}
-	sidecarTemplate := loadConfigMapWithHelm(params, b)
+	sidecarTemplate, _, _ := loadInjectionSettings(b, nil, "")
 	wh, cleanup := createWebhook(b, sidecarTemplate)
 	defer cleanup()
 
@@ -1596,4 +1450,60 @@ func BenchmarkInjectServe(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		wh.serveInject(httptest.NewRecorder(), req)
 	}
+}
+
+func TestEnablePrometheusAggregation(t *testing.T) {
+	tests := []struct {
+		name string
+		mesh *meshconfig.MeshConfig
+		anno map[string]string
+		want bool
+	}{
+		{
+			"no settings",
+			nil,
+			nil,
+			true,
+		},
+		{
+			"mesh on",
+			&meshconfig.MeshConfig{EnablePrometheusMerge: &types.BoolValue{Value: true}},
+			nil,
+			true,
+		},
+		{
+			"mesh off",
+			&meshconfig.MeshConfig{EnablePrometheusMerge: &types.BoolValue{Value: false}},
+			nil,
+			false,
+		},
+		{
+			"annotation on",
+			&meshconfig.MeshConfig{EnablePrometheusMerge: &types.BoolValue{Value: false}},
+			map[string]string{annotation.PrometheusMergeMetrics.Name: "true"},
+			true,
+		},
+		{
+			"annotation off",
+			&meshconfig.MeshConfig{EnablePrometheusMerge: &types.BoolValue{Value: true}},
+			map[string]string{annotation.PrometheusMergeMetrics.Name: "false"},
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := enablePrometheusMerge(tt.mesh, tt.anno); got != tt.want {
+				t.Errorf("enablePrometheusMerge() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// defaultInstallPackageDir returns a path to a snapshot of the helm charts used for testing.
+func defaultInstallPackageDir() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	return filepath.Join(wd, "../../../operator/cmd/mesh/testdata/manifest-generate/data-snapshot")
 }
